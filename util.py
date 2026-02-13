@@ -12,6 +12,34 @@ import os
 import matplotlib.pyplot as plt
 from sklearn.metrics import precision_score, recall_score, confusion_matrix
 import pandas as pd
+import random
+
+def report_split_stats(train_ids, val_ids, df):
+    # 'CORNELL ID' is your key in motor_df
+    t_df = df[df['CORNELL ID'].isin(train_ids)]
+    v_df = df[df['CORNELL ID'].isin(val_ids)]
+    
+    # We use the 'ratio' logic you defined earlier to show responders
+    t_resp = (t_df[' ON (pre-dbs updrs)'] - t_df[' OFF meds ON stim 6mo']) / t_df[' ON (pre-dbs updrs)'] >= 0.30
+    v_resp = (v_df[' ON (pre-dbs updrs)'] - v_df[' OFF meds ON stim 6mo']) / v_df[' ON (pre-dbs updrs)'] >= 0.30
+
+    print(f"\n" + "-"*30)
+    print(f"SPLIT COMPOSITION")
+    print(f"TRAIN: {len(t_df)} subs | Responders: {t_resp.sum()} ({t_resp.mean():.1%})")
+    print(f"VAL:   {len(v_df)} subs | Responders: {v_resp.sum()} ({v_resp.mean():.1%})")
+    print(f"Mean Age (Train/Val): {t_df['Age'].mean():.1f} / {v_df['Age'].mean():.1f}")
+    print(f"Mean Duration: {t_df['Disease Duration (year)'].mean():.1f} / {v_df['Disease Duration (year)'].mean():.1f}")
+    print("-"*30 + "\n")
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed) # if you use multi-GPU
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def mask_crop(data,mask,pad,viz=False):
     z_idx = ~(mask==0).all((0,1))
