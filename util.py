@@ -14,22 +14,52 @@ from sklearn.metrics import precision_score, recall_score, confusion_matrix
 import pandas as pd
 import random
 
-def report_split_stats(train_ids, val_ids, df):
-    # 'CORNELL ID' is your key in motor_df
-    t_df = df[df['CORNELL ID'].isin(train_ids)]
-    v_df = df[df['CORNELL ID'].isin(val_ids)]
+def report_split_stats(train_ids, val_ids, df_raw):
+    # 1. Match IDs
+    train_ids = [int(i) for i in train_ids]
+    val_ids = [int(i) for i in val_ids]
     
-    # We use the 'ratio' logic you defined earlier to show responders
-    t_resp = (t_df[' ON (pre-dbs updrs)'] - t_df[' OFF meds ON stim 6mo']) / t_df[' ON (pre-dbs updrs)'] >= 0.30
-    v_resp = (v_df[' ON (pre-dbs updrs)'] - v_df[' OFF meds ON stim 6mo']) / v_df[' ON (pre-dbs updrs)'] >= 0.30
+    # 2. Slice and CLEAN the dataframe
+    t_df = df_raw[df_raw['CORNELL ID'].astype(int).isin(train_ids)].copy()
+    v_df = df_raw[df_raw['CORNELL ID'].astype(int).isin(val_ids)].copy()
+    
+    # --- FIX: Force numeric conversion for the columns used in stats ---
+    cols_to_fix = ['Age', 'Disease Duration (year)', ' ON (pre-dbs updrs)', ' OFF meds ON stim 6mo']
+    for df in [t_df, v_df]:
+        for col in cols_to_fix:
+            if col in df.columns:
+                # errors='coerce' turns that long "57877..." string into NaN
+                df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    print(f"\n" + "-"*30)
-    print(f"SPLIT COMPOSITION")
-    print(f"TRAIN: {len(t_df)} subs | Responders: {t_resp.sum()} ({t_resp.mean():.1%})")
-    print(f"VAL:   {len(v_df)} subs | Responders: {v_resp.sum()} ({v_resp.mean():.1%})")
-    print(f"Mean Age (Train/Val): {t_df['Age'].mean():.1f} / {v_df['Age'].mean():.1f}")
-    print(f"Mean Duration: {t_df['Disease Duration (year)'].mean():.1f} / {v_df['Disease Duration (year)'].mean():.1f}")
-    print("-"*30 + "\n")
+    # 3. Calculate Responder Stats
+    def get_resp_info(sub_df):
+        if len(sub_df) == 0: return 0, 0.0
+        pre = sub_df[' ON (pre-dbs updrs)']
+        post = sub_df[' OFF meds ON stim 6mo']
+        # Use .replace(0, np.nan) to avoid division by zero errors
+        improvement = (pre - post) / pre.replace(0, np.nan) 
+        responders = (improvement >= 0.30).sum()
+        return responders, responders / len(sub_df)
+
+    t_count, t_pct = get_resp_info(t_df)
+    v_count, v_pct = get_resp_info(v_df)
+
+    # 4. Target Distribution
+    target_col = ' Target' 
+    t_targets = t_df[target_col].value_counts(normalize=True).to_dict() if target_col in t_df.columns else {}
+    v_targets = v_df[target_col].value_counts(normalize=True).to_dict() if target_col in v_df.columns else {}
+
+    print(f"\n" + "="*50)
+    print(f"SPLIT DATA PROFILE (RAW UNITS)")
+    print(f"TRAIN: {len(t_df):>3} subs | Responders: {t_count:>2} ({t_pct:>6.1%})")
+    print(f"VAL:   {len(v_df):>3} subs | Responders: {v_count:>2} ({v_pct:>6.1%})")
+    
+    # .mean() now works because the strings are gone!
+    print(f"Mean Age (T/V):      {t_df['Age'].mean():.1f} / {v_df['Age'].mean():.1f}")
+    print(f"Mean Duration (T/V): {t_df['Disease Duration (year)'].mean():.1f} / {v_df['Disease Duration (year)'].mean():.1f}")
+    print(f"Targets (T): { {k: f'{v:.1%}' for k, v in t_targets.items()} }")
+    print(f"Targets (V): { {k: f'{v:.1%}' for k, v in v_targets.items()} }")
+    print("="*50 + "\n")
 
 def seed_everything(seed=42):
     random.seed(seed)

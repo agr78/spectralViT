@@ -1,46 +1,23 @@
-# import torch
-# from util import calc_metrics
-# from sklearn.metrics import roc_auc_score
-
-# def val_model(val_loader,device,model,loss_fn,val_subset):
-#     y_true = []
-#     y_pred_diff = []
-#     val_loss_cls_diff = 0.0
-#     with torch.no_grad():
-#         for val_x, val_y in val_loader:
-#             val_x, val_y = val_x.to(device), val_y.to(device)
-#             t_dummy = torch.zeros(val_x.size(0), dtype=torch.long, device=device)
-#             # unwrap model if DataParallel is used
-#             model_unwrapped = model.module if isinstance(model, torch.nn.DataParallel) else model
-
-#             try:
-#                 # call get_label_embedding on unwrapped model
-#                 cond_val = model_unwrapped.get_label_embedding(val_y)
-#                 _, logits_val_diff = model(val_x, t_dummy, cond_val)
-#             except AttributeError:
-#                 logits_val_diff, _ = model(val_x)
-#             preds_diff = logits_val_diff.argmax(dim=1)
-#             val_loss_cls_diff += loss_fn(logits_val_diff, val_y).item() * val_x.size(0)
-
-#             y_true.extend(val_y.cpu().numpy())
-#             y_pred_diff.extend(preds_diff.cpu().numpy())
-#     val_loss_cls_diff /= len(val_subset)
-#     acc, prec, sens, spec = calc_metrics(y_true, y_pred_diff)
-#     auc = roc_auc_score(y_true, y_pred_diff)
-#     return val_loss_cls_diff, acc, prec, sens, spec, auc
-
-
 from util import calc_metrics, q_sample
 from sklearn.metrics import roc_auc_score, roc_curve
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from sklearn.metrics import roc_curve, confusion_matrix
 
+class ValLoaderWrapper:
+    def __init__(self, loader):
+        self.loader = loader
+        self.dataset = loader.dataset
+    def __iter__(self):
+        for batch in self.loader:
+            yield batch[:3]
+    def __len__(self):
+        return len(self.loader)
+
 @torch.no_grad()
-def val_model_stable(val_loader, device, model, loss_fn, val_subset, threshold=0.5):
+def val_model(val_loader, device, model, loss_fn, val_subset, threshold=0.5):
     model.eval()
     val_loss = 0
     all_probs = []
@@ -88,59 +65,6 @@ def val_model_stable(val_loader, device, model, loss_fn, val_subset, threshold=0
     # Return: Loss, Acc, Prec, Sens, Spec, AUC
     # (Double check your calc_metrics return order matches: Acc, Prec, Sens, Spec)
     return np.array([avg_loss, metrics[0], metrics[1], metrics[2], metrics[3], auc])
-
-def val_model(val_loader, device, model, loss_fn, val_subset):
-    """
-    Universal validation routine supporting:
-      - JointDiffusionUNet (expects x, t, cond)
-      - JointDiffusionEncoderClassifier / Vanilla_Classifier (expects x only)
-      - torchvision models (ResNet, ViT, etc., returns logits only)
-    """
-    y_true = []
-    y_pred_diff = []
-    val_loss_cls_diff = 0.0
-    model.eval()
-
-    with torch.no_grad():
-        for val_x, val_y in val_loader:
-            val_x, val_y = val_x.to(device), val_y.to(device)
-            t_dummy = torch.zeros(val_x.size(0), dtype=torch.long, device=device)
-
-            # unwrap model if DataParallel is used
-            model_unwrapped = model.module if isinstance(model, torch.nn.DataParallel) else model
-
-            try:
-                # Diffusion-style model with label embeddings
-                cond_val = model_unwrapped.get_label_embedding(val_y)
-                _, logits_val_diff = model(val_x, t_dummy, cond_val)
-
-            except AttributeError:
-                # Standard classifier (ResNet, encoder classifier, etc.)
-                outputs = model(val_x)
-                # handle possible tuple outputs
-                if isinstance(outputs, tuple):
-                    logits_val_diff = outputs[0]
-                else:
-                    logits_val_diff = outputs
-
-            preds_diff = logits_val_diff.argmax(dim=1)
-            val_loss_cls_diff += loss_fn(logits_val_diff, val_y).item() * val_x.size(0)
-
-            y_true.extend(val_y.cpu().numpy())
-            y_pred_diff.extend(preds_diff.cpu().numpy())
-
-    # compute aggregated metrics
-    val_loss_cls_diff /= len(val_subset)
-    acc, prec, sens, spec = calc_metrics(y_true, y_pred_diff)
-    try:
-        auc = roc_auc_score(y_true, y_pred_diff)
-    except Exception:
-        auc = 0.0  # handle single-class edge cases safely
-
-    return val_loss_cls_diff, acc, prec, sens, spec, auc
-import torch
-import torch.nn.functional as F
-import numpy as np
 
 # -----------------------------
 # Validation for scalar regression (any model)
