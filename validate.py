@@ -1,43 +1,54 @@
-# import torch
-# from util import calc_metrics
-# from sklearn.metrics import roc_auc_score
-
-# def val_model(val_loader,device,model,loss_fn,val_subset):
-#     y_true = []
-#     y_pred_diff = []
-#     val_loss_cls_diff = 0.0
-#     with torch.no_grad():
-#         for val_x, val_y in val_loader:
-#             val_x, val_y = val_x.to(device), val_y.to(device)
-#             t_dummy = torch.zeros(val_x.size(0), dtype=torch.long, device=device)
-#             # unwrap model if DataParallel is used
-#             model_unwrapped = model.module if isinstance(model, torch.nn.DataParallel) else model
-
-#             try:
-#                 # call get_label_embedding on unwrapped model
-#                 cond_val = model_unwrapped.get_label_embedding(val_y)
-#                 _, logits_val_diff = model(val_x, t_dummy, cond_val)
-#             except AttributeError:
-#                 logits_val_diff, _ = model(val_x)
-#             preds_diff = logits_val_diff.argmax(dim=1)
-#             val_loss_cls_diff += loss_fn(logits_val_diff, val_y).item() * val_x.size(0)
-
-#             y_true.extend(val_y.cpu().numpy())
-#             y_pred_diff.extend(preds_diff.cpu().numpy())
-#     val_loss_cls_diff /= len(val_subset)
-#     acc, prec, sens, spec = calc_metrics(y_true, y_pred_diff)
-#     auc = roc_auc_score(y_true, y_pred_diff)
-#     return val_loss_cls_diff, acc, prec, sens, spec, auc
-
-
 from util import calc_metrics, q_sample
-from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.metrics import roc_auc_score, balanced_accuracy_score, f1_score
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sklearn.metrics import roc_curve, confusion_matrix
+def calibrate(model, X_v, y_v, device):
+    model.eval()
+    with torch.no_grad():
+        p = model(torch.tensor(X_v, dtype=torch.float32).to(device), mode='fine_tune').cpu().numpy()
+    best_t, best_f1 = 0.5, 0
+    for t in np.linspace(0.1, 0.9, 81):
+        score = f1_score(y_v, (p >= t))
+        if score > best_f1: best_f1, best_t = score, t
+    return best_t
+
+def calibrate_attn(model, attn, X_v, y_v, device):
+    model.eval(); attn.eval()
+    with torch.no_grad():
+        x_t = torch.tensor(X_v, dtype=torch.float32).to(device)
+        p = model(attn(x_t), mode='fine_tune').cpu().numpy()
+    best_t, best_f1 = 0.5, 0
+    for t in np.linspace(0.1, 0.9, 81):
+        score = f1_score(y_v, (p >= t))
+        if score > best_f1: best_f1, best_t = score, t
+    return best_t
+
+def calibrate_balanced(model, attn, X_v, y_v, device):
+    model.eval()
+    if attn: attn.eval()
+    with torch.no_grad():
+        x_t = torch.tensor(X_v, dtype=torch.float32).to(device)
+        p = model(attn(x_t) if attn else x_t, mode='fine_tune').cpu().numpy()
+    best_t, best_bal = 0.5, 0
+    for t in np.linspace(0.01, 0.9, 100): # Wider sweep
+        score = balanced_accuracy_score(y_v, (p >= t))
+        if score > best_bal:
+            best_bal, best_t = score, t
+    return best_t
+
+def calibrate_balanced_full_attn(model, spec_attn, X_v, y_v, device):
+    model.eval(); spec_attn.eval()
+    with torch.no_grad():
+        x_v_t = torch.tensor(X_v, dtype=torch.float32).to(device)
+        p = model(spec_attn(x_v_t), mode='fine_tune').cpu().numpy()
+    best_t, best_score = 0.5, 0
+    for t in np.linspace(0.1, 0.9, 81):
+        score = balanced_accuracy_score(y_v, (p >= t))
+        if score > best_score: best_score, best_t = score, t
+    return best_t
 
 @torch.no_grad()
 def val_model_stable(val_loader, device, model, loss_fn, val_subset, threshold=0.5):
@@ -64,7 +75,7 @@ def val_model_stable(val_loader, device, model, loss_fn, val_subset, threshold=0
             loss = loss_fn(logits, val_y)
             val_loss += loss.item()
 
-            # Probability for Index 0 (Non-Responders / Minority)
+            # ML conventions
             probs = torch.softmax(logits, dim=1)[:, 0]
             all_probs.extend(probs.cpu().numpy())
             all_labels.extend(val_y.cpu().numpy())
@@ -138,9 +149,6 @@ def val_model(val_loader, device, model, loss_fn, val_subset):
         auc = 0.0  # handle single-class edge cases safely
 
     return val_loss_cls_diff, acc, prec, sens, spec, auc
-import torch
-import torch.nn.functional as F
-import numpy as np
 
 # -----------------------------
 # Validation for scalar regression (any model)
@@ -174,7 +182,6 @@ def val_model_regression(loader, model, device):
         np.mean(mae_list),
         r2.item()
     ])
-
 
 # -----------------------------------------------------
 # Diffusion + regression validation
@@ -212,4 +219,12 @@ def val_model_regression_diffusion(loader, model, device, timesteps, alphas):
 
     return np.array([np.mean(mse_list), np.mean(mae_list), r2.item()])
 
-
+class ValLoaderWrapper:
+    def __init__(self, loader):
+        self.loader = loader
+        self.dataset = loader.dataset
+    def __iter__(self):
+        for batch in self.loader:
+            yield batch[:3]
+    def __len__(self):
+        return len(self.loader)
