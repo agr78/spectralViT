@@ -106,7 +106,6 @@ def build_stable_template(files, img_dir, seg_dir, target_shape_out):
 
 # --- Parallel Worker for Loading ---
 def get_processed_data_worker(f, img_dir, seg_dir, clinical_dict, label_map, EXCLUDE_IDS, target_shape=None):
-    print(f">>> Loading and clinical mapping (excluding {EXCLUDE_IDS})...")
     match = re.search(r'\d+', f)
     if not match: return None
     sub_id_int = int(match.group())
@@ -182,7 +181,6 @@ def register_worker(data, target_template_numpy):
     }
 
 def get_processed_data_worker_chh(f, img_dir, seg_dir, clinical_dict, label_map, EXCLUDE_IDS, target_shape=None):
-    print(f">>> Loading and clinical mapping (excluding {EXCLUDE_IDS})...")
     match = re.search(r'\d+', f)
     if not match: return None
     sub_id_int = int(match.group())

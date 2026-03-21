@@ -31,7 +31,7 @@ def calibrate_balanced(model, attn, X_v, y_v,device):
         p = model(attn(x_t) if attn else x_t, mode='fine_tune').cpu().numpy()
     
     best_t, best_bal = 0.5, 0
-    for t in np.linspace(0.01, 0.9, 100): #100, 150
+    for t in np.linspace(0.01, 0.9, 95): #100, 150
         score = balanced_accuracy_score(y_v, (p >= t))
         if score > best_bal:
             best_bal, best_t = score, t

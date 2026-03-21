@@ -3,6 +3,25 @@ import torch.nn as nn
 import torch
 import torch.nn as nn
 
+class ClinicalTransformer(nn.Module):
+    def __init__(self, n_inputs, embed_dim=32, n_heads=4, n_layers=2):
+        super().__init__()
+        self.embedding = nn.Linear(1, embed_dim)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=n_heads, dim_feedforward=embed_dim*2)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.fc = nn.Linear(embed_dim * n_inputs, 1)
+
+    def forward(self, x, return_logit=False, **kwargs):
+        if x.ndim == 1: x = x.unsqueeze(0)
+        x = x.unsqueeze(-1)
+        x = self.embedding(x)
+        x = x.permute(1, 0, 2)
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2).flatten(1)
+        logit = self.fc(x).squeeze()
+        if logit.ndim == 0: logit = logit.unsqueeze(0) # handle single-sample batch
+        return logit if return_logit else torch.sigmoid(logit)
+
 class SequentialSpectralAttention(nn.Module):
     def __init__(self, n_components, n_clinical, embed_dim=32, n_heads=4, tau_0=16, alpha_0=0.1):
         super().__init__()
