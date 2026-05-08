@@ -1,3 +1,11 @@
 # Ignore PyTorch model files
 *.pt
 *.pth
+ixi_nd.ipynb
+ixi_last.ipynb
+mt.ipynb
+registration.py
+simc.ipynb
+spat_v_spect.ipynb
+unet_comp.ipynb
+zvit.ipynb
