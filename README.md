@@ -9,8 +9,8 @@ hierarchical order. Our approach introduces a global inductive bias and spectral
 Efficient image tokenization using projections on to spectral bases to reduce the number of parameters associated with fitting vision transformers.
 
 ## Contents
-Basis properties <br/>
-Pattern classification <br/>
-Object detection <br/>
-Sex classification <br/>
-Candidate selection <br/>
+Various tokenizations can be found in `bases.ipynb` <br/>
+Sample size varying pattern classifications can be found in `pattern.ipynb` <br/>
+The spatially invariant Fourier basis example can be found in `objects.ipynb` <br/>
+Sex classification for all models can be found in `ixi.ipynb` <br/>
+Candidate selection can be found in `dbs.ipynb` <br/>
