@@ -2,12 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class SpectralViT(nn.Module):
     """
-    Unified Spectral ViT.
-    DBS behavior: use_input_proj=False, pooling='flatten', d_model=1
-    IXI behavior: use_mode_weights=True, pooling='mean', d_model=embed_dim
+    Fully Unified Spectral ViT.
+    Works for:
+    1. Simulation script (needs learnable_rank_weights=False, use_layer_norm=False)
+    2. Medical script (needs use_input_proj, use_pos_embed, use_mode_weights)
     """
     def __init__(
         self, 
@@ -16,10 +16,11 @@ class SpectralViT(nn.Module):
         embed_dim=16, 
         n_layers=4, 
         use_mode_weights=False,
-        use_input_proj=True,    
-        use_pos_embed=True,     
+        use_input_proj=True,    # Restored
+        use_pos_embed=True,     # Restored
         pooling='mean',         
         use_layer_norm=True,    
+        learnable_rank_weights=True,
         use_sigmoid=False       
     ):
         super().__init__()
@@ -29,11 +30,15 @@ class SpectralViT(nn.Module):
         self.use_sigmoid = use_sigmoid
         self.use_input_proj = use_input_proj
 
-        # Spectral decay (1/f)
+        # 1. Spectral decay (1/f) logic
         ranks = torch.arange(1, n_inputs + 1, dtype=torch.float32)
-        self.rank_weights = nn.Parameter(1.0 / ranks)
+        if learnable_rank_weights:
+            self.rank_weights = nn.Parameter(1.0 / ranks)
+        else:
+            self.register_buffer('rank_weights', 1.0 / ranks)
 
-        # DBS sets d_model=1 by disabling input_proj. IXI uses embed_dim.
+        # 2. Input Projection Logic
+        # DBS/IXI behavior uses d_model=1 or d_model=embed_dim
         self.d_model = embed_dim if (use_input_proj or use_mode_weights) else 1
 
         if self.use_mode_weights:
@@ -43,9 +48,11 @@ class SpectralViT(nn.Module):
         else:
             self.input_proj = nn.Identity()
 
+        # 3. Positional Embedding Logic
         if self.use_pos_embed:
             self.pos_embed = nn.Parameter(torch.randn(n_inputs, 1, self.d_model) * 0.02)
 
+        # 4. Transformer
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.d_model, 
             nhead=n_heads, 
@@ -54,6 +61,7 @@ class SpectralViT(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
+        # 5. Head Logic
         head_in = self.d_model if pooling == 'mean' else (self.d_model * n_inputs)
         
         if use_layer_norm:
@@ -63,19 +71,25 @@ class SpectralViT(nn.Module):
 
     def forward(self, x, return_logit=False):
         if x.ndim == 1: x = x.unsqueeze(0)
+        
+        # Apply 1/f weighting
         x = x * self.rank_weights
         
+        # Apply Projection
         if self.use_mode_weights:
             x = x.unsqueeze(-1) * self.mode_weights.unsqueeze(0)
             x = x.transpose(0, 1)
         else:
+            # Result: [seq_len, batch, d_model]
             x = self.input_proj(x.unsqueeze(-1)).transpose(0, 1)
         
+        # Add Position
         if self.use_pos_embed:
             x = x + self.pos_embed
             
         x = self.transformer(x)
         
+        # Pooling
         if self.pooling == 'mean':
             x = x.mean(dim=0)
         else:
@@ -87,7 +101,6 @@ class SpectralViT(nn.Module):
         if self.use_sigmoid and not return_logit:
             return torch.sigmoid(logit)
         return logit
-
 
 class SpatialViT(nn.Module):
     """
