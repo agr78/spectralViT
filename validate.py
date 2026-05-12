@@ -1,230 +1,293 @@
-from util import calc_metrics, q_sample
-from sklearn.metrics import roc_auc_score, balanced_accuracy_score, f1_score
-import numpy as np
 import torch
+import torch.optim as optim
 import torch.nn as nn
-import torch.nn.functional as F
+import numpy as np
+from torch.utils.data import DataLoader, TensorDataset
+from torch.optim.lr_scheduler import OneCycleLR
+from sklearn.decomposition import PCA
+from sklearn.model_selection import KFold
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import StandardScaler
+from util import mean_std_str, seed_everything
+from networks import SpectralViT, SpatialViT
 
-def calibrate(model, X_v, y_v, device):
-    model.eval()
-    with torch.no_grad():
-        p = model(torch.tensor(X_v, dtype=torch.float32).to(device), mode='fine_tune').cpu().numpy()
-    best_t, best_f1 = 0.5, 0
-    for t in np.linspace(0.1, 0.9, 81):
-        score = f1_score(y_v, (p >= t))
-        if score > best_f1: best_f1, best_t = score, t
-    return best_t
 
-def calibrate_attn(model, attn, X_v, y_v, device):
-    model.eval(); attn.eval()
-    with torch.no_grad():
-        x_t = torch.tensor(X_v, dtype=torch.float32).to(device)
-        p = model(attn(x_t), mode='fine_tune').cpu().numpy()
-    best_t, best_f1 = 0.5, 0
-    for t in np.linspace(0.1, 0.9, 81):
-        score = f1_score(y_v, (p >= t))
-        if score > best_f1: best_f1, best_t = score, t
-    return best_t
+import torch
+import torch.optim as optim
+import torch.nn as nn
+import numpy as np
+from torch.utils.data import DataLoader, TensorDataset
+from torch.optim.lr_scheduler import OneCycleLR
+from sklearn.decomposition import PCA
+from sklearn.model_selection import KFold
+from sklearn.metrics import roc_auc_score
+from util import mean_std_str, seed_everything
+from networks import SpectralViT, SpatialViT
 
-def calibrate_balanced(model, attn, X_v, y_v, device):
-    model.eval()
-    if attn: attn.eval()
-    with torch.no_grad():
-        x_t = torch.tensor(X_v, dtype=torch.float32).to(device)
-        p = model(attn(x_t) if attn else x_t, mode='fine_tune').cpu().numpy()
-    best_t, best_bal = 0.5, 0
-    for t in np.linspace(0.01, 0.9, 100): # Wider sweep
-        score = balanced_accuracy_score(y_v, (p >= t))
-        if score > best_bal:
-            best_bal, best_t = score, t
-    return best_t
+import torch
+import torch.optim as optim
+import torch.nn as nn
+import numpy as np
+from torch.utils.data import DataLoader, TensorDataset
+from torch.optim.lr_scheduler import OneCycleLR
+from sklearn.decomposition import PCA
+from sklearn.model_selection import KFold
+from sklearn.metrics import roc_auc_score
+from util import mean_std_str, seed_everything
+from networks import SpectralViT, SpatialViT
 
-def calibrate_balanced_full_attn(model, spec_attn, X_v, y_v, device):
-    model.eval(); spec_attn.eval()
-    with torch.no_grad():
-        x_v_t = torch.tensor(X_v, dtype=torch.float32).to(device)
-        p = model(spec_attn(x_v_t), mode='fine_tune').cpu().numpy()
-    best_t, best_score = 0.5, 0
-    for t in np.linspace(0.1, 0.9, 81):
-        score = balanced_accuracy_score(y_v, (p >= t))
-        if score > best_score: best_score, best_t = score, t
-    return best_t
-
-@torch.no_grad()
-def val_model_stable(val_loader, device, model, loss_fn, val_subset, threshold=0.5):
-    model.eval()
-    val_loss = 0
-    all_probs = []
-    all_labels = []
-
-    with torch.no_grad():
-        for val_x, val_clin, val_y in val_loader:
-            val_x, val_clin, val_y = val_x.to(device), val_clin.to(device), val_y.to(device)
-
-            t_dummy = torch.zeros(val_x.size(0), device=device).long()
-
-            # Model Inference
-            if hasattr(model, 'clinical_mlp'): 
-                if hasattr(model, 'time_mlp'): 
-                    _, logits = model(val_x, t_dummy, clinical_vec=val_clin)
-                else: 
-                    logits, _ = model(val_x, clinical_vec=val_clin)
-            else: 
-                logits, _ = model(val_x, clinical_vec=val_clin)
-
-            loss = loss_fn(logits, val_y)
-            val_loss += loss.item()
-
-            # ML conventions
-            probs = torch.softmax(logits, dim=1)[:, 0]
-            all_probs.extend(probs.cpu().numpy())
-            all_labels.extend(val_y.cpu().numpy())
-
-    avg_loss = val_loss / len(val_loader)
-    all_labels = np.array(all_labels)
-    all_probs = np.array(all_probs)
+def SpectralViT_cv(X_flat, Y, pca_candidates, device, epochs=20, lr=1e-3):
+    """EXACT replication of the standalone Spectral script logic."""
     
-    # Label Logic: 
-    # all_labels is 0 for Non-Responder, 1 for Responder.
-    # We want to treat Non-Responders (0) as the 'positive' case for metrics.
-    metric_labels = (all_labels == 0).astype(int) 
-
-    from util import calc_metrics
-    from sklearn.metrics import roc_auc_score
+    # 1. To match the standalone script, we must reset the seed to 0 
+    # RIGHT before we start the candidate loop.
+    seed_everything(0)
     
-    # Calculate AUC and other metrics specifically for the Non-Responder class
-    metrics = calc_metrics(metric_labels, all_probs, threshold=threshold)
-    auc = roc_auc_score(metric_labels, all_probs)
-    
-    # Return: Loss, Acc, Prec, Sens, Spec, AUC
-    # (Double check your calc_metrics return order matches: Acc, Prec, Sens, Spec)
-    return np.array([avg_loss, metrics[0], metrics[1], metrics[2], metrics[3], auc])
+    # 2. Replicate the 'leaked' BATCH_SIZE = len(ts_y).
+    # In a 5-fold split of IXI (566 samples), the last fold size is 113.
+    # We simulate this by taking the last fold size of a dummy split.
+    kf_peek = KFold(n_splits=5, shuffle=True, random_state=0)
+    for _, test_idx in kf_peek.split(X_flat):
+        fixed_batch_size = len(test_idx) 
 
-def val_model(val_loader, device, model, loss_fn, val_subset):
+    results = {}
+    print(f"\nStarting Selection over PCA components: {pca_candidates}")
+
+    for n_comp in pca_candidates:
+        kf = KFold(n_splits=5, shuffle=True, random_state=0)
+        fold_aucs = []
+        
+        for train_idx, test_idx in kf.split(X_flat):
+            torch.cuda.empty_cache()
+            
+            # Fit PCA
+            pca_model = PCA(n_components=n_comp, whiten=True).fit(X_flat[train_idx])
+            tr_pca = torch.from_numpy(pca_model.transform(X_flat[train_idx])).float()
+            tr_y = torch.from_numpy(Y[train_idx]).float()
+            ts_pca = torch.from_numpy(pca_model.transform(X_flat[test_idx])).float().to(device)
+            ts_y_fold = torch.from_numpy(Y[test_idx]).float().to(device)
+            
+            # Use the FIXED batch size to match the original script's global variable
+            loader = DataLoader(TensorDataset(tr_pca, tr_y), batch_size=fixed_batch_size, shuffle=True)
+            
+            # Initialize Model
+            model = SpectralViT(
+                n_inputs=n_comp, n_heads=2, embed_dim=16, n_layers=4,
+                patch_size=1, use_rank_weights=True, learnable_rank_weights=True,
+                use_input_proj=True, use_pos_embed=True, pooling='mean',
+                use_layer_norm=True, use_sigmoid=False
+            ).to(device)
+            
+            opt = optim.AdamW(model.parameters(), lr=lr)
+            sched = OneCycleLR(opt, max_lr=lr, steps_per_epoch=len(loader), epochs=epochs)
+            crit = nn.BCEWithLogitsLoss()
+            
+            for _ in range(epochs):
+                model.train()
+                for b_pca, b_y in loader:
+                    b_pca, b_y = b_pca.to(device), b_y.to(device)
+                    opt.zero_grad()
+                    loss = crit(model(b_pca), b_y)
+                    loss.backward()
+                    opt.step()
+                    sched.step()
+            
+            model.eval()
+            with torch.no_grad():
+                probs = torch.sigmoid(model(ts_pca)).cpu().numpy()
+                fold_aucs.append(roc_auc_score(ts_y_fold.cpu(), probs))
+        
+        results[n_comp] = fold_aucs
+        print(f"  n_components={n_comp}: AUC = {mean_std_str(fold_aucs)}")
+
+    return max(results, key=lambda k: np.mean(results[k]))
+
+def SpatialViT_cv(X, Y, patch_candidates, device, vol_size=96, epochs=20, lr=1e-3, physical_bs=2, effective_bs=8):
+    """EXACT replication of the standalone Spatial script logic."""
+    # Reset seed to 0 before starting the spatial grid
+    seed_everything(0)
+    
+    accumulation_steps = effective_bs // physical_bs
+    results = {}
+    print(f"\nStarting Selection over Patch Sizes: {patch_candidates}")
+
+    for p_size in patch_candidates:
+        kf = KFold(n_splits=5, shuffle=True, random_state=0)
+        fold_aucs = []
+        
+        for train_idx, test_idx in kf.split(X):
+            torch.cuda.empty_cache()
+            
+            tr_vol = torch.from_numpy(X[train_idx]).unsqueeze(1).float()
+            tr_y   = torch.from_numpy(Y[train_idx]).float()
+            ts_vol = torch.from_numpy(X[test_idx]).unsqueeze(1).float().to(device)
+            ts_y_fold = torch.from_numpy(Y[test_idx]).float().to(device)
+            
+            loader = DataLoader(TensorDataset(tr_vol, tr_y), batch_size=physical_bs, shuffle=True)
+            
+            model = SpatialViT(
+                vol_size=vol_size, patch_size=p_size, embed_dim=128, n_heads=4, n_layers=2,
+                dropout=0.2, is_2d=False, use_cls_token=True, use_layer_norm=True, use_sigmoid=False
+            ).to(device)
+            
+            opt = optim.AdamW(model.parameters(), lr=lr)
+            steps_per_epoch = len(loader) // accumulation_steps
+            sched = OneCycleLR(opt, max_lr=lr, steps_per_epoch=steps_per_epoch, epochs=epochs)
+            crit = nn.BCEWithLogitsLoss()
+            
+            for _ in range(epochs):
+                model.train()
+                for i, (b_vol, b_y) in enumerate(loader):
+                    b_vol, b_y = b_vol.to(device), b_y.to(device)
+                    loss = crit(model(b_vol), b_y) / accumulation_steps
+                    loss.backward()
+                    if (i + 1) % accumulation_steps == 0:
+                        opt.step()
+                        sched.step()
+                        opt.zero_grad()
+            
+            model.eval()
+            with torch.no_grad():
+                test_probs = []
+                for chunk in torch.split(ts_vol, physical_bs):
+                    test_probs.append(torch.sigmoid(model(chunk)))
+                probs = torch.cat(test_probs).cpu().numpy()
+                fold_aucs.append(roc_auc_score(ts_y_fold.cpu(), probs))
+                
+        results[p_size] = fold_aucs
+        print(f"  patch_size={p_size}: AUC = {mean_std_str(fold_aucs)}")
+
+    return max(results, key=lambda k: np.mean(results[k]))
+
+def ClinicalTransformer_cv(model_class, model_kwargs, pos_weight_grid, outer_skf, unique_subjs, y_unique, tr_subj_map, X_tr_clin, y_tr_slices, NEG_WEIGHT, criterion, JITTER_STD, EPOCHS, device):
     """
-    Universal validation routine supporting:
-      - JointDiffusionUNet (expects x, t, cond)
-      - JointDiffusionEncoderClassifier / Vanilla_Classifier (expects x only)
-      - torchvision models (ResNet, ViT, etc., returns logits only)
+    Optimizes pos_weight by re-initializing the model for every fold to prevent data leakage
+    and cumulative training bias.
     """
-    y_true = []
-    y_pred_diff = []
-    val_loss_cls_diff = 0.0
-    model.eval()
+    print("\n Optimizing `pos_weight` via clinical transformer...")
+    weight_results = {k: [] for k in pos_weight_grid}
+    
+    for pos_weight in pos_weight_grid:
+        fold_aucs = []
+        for fold_idx, (train_subj_idx, val_subj_idx) in enumerate(outer_skf.split(unique_subjs, y_unique)):
+            # --- FIX: Re-initialize the model for every fold ---
+            model = model_class(**model_kwargs).to(device)
+            
+            train_subjects, val_subjects = unique_subjs[train_subj_idx], unique_subjs[val_subj_idx]
+            train_mask, val_mask = np.isin(tr_subj_map, train_subjects), np.isin(tr_subj_map, val_subjects)
 
-    with torch.no_grad():
-        for val_x, val_y in val_loader:
-            val_x, val_y = val_x.to(device), val_y.to(device)
-            t_dummy = torch.zeros(val_x.size(0), dtype=torch.long, device=device)
+            X_train_clin_t = torch.tensor(X_tr_clin[train_mask], dtype=torch.float32).to(device)
+            y_train_t = torch.tensor(y_tr_slices[train_mask], dtype=torch.float32).to(device)
+            X_val_clin_t = torch.tensor(X_tr_clin[val_mask], dtype=torch.float32).to(device)
+            y_val = y_tr_slices[val_mask]
 
-            # unwrap model if DataParallel is used
-            model_unwrapped = model.module if isinstance(model, torch.nn.DataParallel) else model
+            # Optimizer must be linked to the fresh model's parameters
+            optimizer = optim.Adam(model.parameters(), lr=1e-4)
+            w = torch.where(y_train_t == 0, torch.tensor(NEG_WEIGHT, device=device), torch.tensor(pos_weight, device=device))
 
-            try:
-                # Diffusion-style model with label embeddings
-                cond_val = model_unwrapped.get_label_embedding(val_y)
-                _, logits_val_diff = model(val_x, t_dummy, cond_val)
+            for epoch in range(EPOCHS):
+                model.train()
+                optimizer.zero_grad()
+                X_jitter = X_train_clin_t + torch.randn_like(X_train_clin_t) * JITTER_STD
+                loss = criterion(model(X_jitter), y_train_t, weight=w)
+                loss.backward()
+                optimizer.step()
 
-            except AttributeError:
-                # Standard classifier (ResNet, encoder classifier, etc.)
-                outputs = model(val_x)
-                # handle possible tuple outputs
-                if isinstance(outputs, tuple):
-                    logits_val_diff = outputs[0]
-                else:
-                    logits_val_diff = outputs
+            model.eval()
+            with torch.no_grad():
+                val_probs = model(X_val_clin_t).cpu().numpy()
+                val_subj_probs = [val_probs[tr_subj_map[val_mask] == s].mean() for s in val_subjects]
+                val_subj_labels = [y_val[tr_subj_map[val_mask] == s][0] for s in val_subjects]
+                fold_aucs.append(roc_auc_score(val_subj_labels, val_subj_probs))
 
-            preds_diff = logits_val_diff.argmax(dim=1)
-            val_loss_cls_diff += loss_fn(logits_val_diff, val_y).item() * val_x.size(0)
+        weight_results[pos_weight] = fold_aucs
+        print(f"  Pos Weight={pos_weight}: AUC = {mean_std_str(fold_aucs)}")
 
-            y_true.extend(val_y.cpu().numpy())
-            y_pred_diff.extend(preds_diff.cpu().numpy())
+    # Selection logic based on your original snippet (minimizing standard deviation)
+    SELECTED_POS_WEIGHT = pos_weight_grid[np.argmin([np.std(weight_results[pw]) for pw in pos_weight_grid])]
+    print(f"Selected positive weight: {SELECTED_POS_WEIGHT}")
+    return SELECTED_POS_WEIGHT
 
-    # compute aggregated metrics
-    val_loss_cls_diff /= len(val_subset)
-    acc, prec, sens, spec = calc_metrics(y_true, y_pred_diff)
-    try:
-        auc = roc_auc_score(y_true, y_pred_diff)
-    except Exception:
-        auc = 0.0  # handle single-class edge cases safely
 
-    return val_loss_cls_diff, acc, prec, sens, spec, auc
+def ResidualSpectralViT_cv(model_classes, model_kwargs, pca_components_grid, outer_skf, unique_subjs, y_unique, tr_subj_map, X_tr_slices, X_tr_clin, y_tr_slices, NEG_WEIGHT, SELECTED_POS_WEIGHT, criterion, JITTER_STD, EPOCHS, device):
+    pca_results = {k: [] for k in pca_components_grid}
+    print("\n Optimizing `n_components` with spectral ViT")
+    
+    # Extract classes from the passed dictionary for readability
+    CT_Class = model_classes['clinical']
+    ViT_Class = model_classes['vit']
+    Wrapper_Class = model_classes['wrapper']
 
-# -----------------------------
-# Validation for scalar regression (any model)
-# -----------------------------
-@torch.no_grad()
-def val_model_regression(loader, model, device):
-    model.eval()
-    mse_list, mae_list = [], []
-    y_true_list, y_pred_list = [], []
+    for n_comp in pca_components_grid:
+        fold_aucs = []
+        for fold_idx, (train_subj_idx, val_subj_idx) in enumerate(outer_skf.split(unique_subjs, y_unique)):
+            train_subjects, val_subjects = unique_subjs[train_subj_idx], unique_subjs[val_subj_idx]
+            train_mask, val_mask = np.isin(tr_subj_map, train_subjects), np.isin(tr_subj_map, val_subjects)
 
-    for x, y in loader:
-        x = x.to(device)
-        y = y.float().to(device).unsqueeze(1)
+            # Fit Scaler and PCA only on training data to prevent leakage
+            f_img_scaler = StandardScaler().fit(X_tr_slices[train_mask])
+            f_pca = PCA(n_components=n_comp, random_state=0, whiten=True).fit(
+                f_img_scaler.transform(X_tr_slices[train_mask])
+            )
 
-        pred = model(x).squeeze(1)
+            # Prepare Tensors
+            X_tr_clin_t = torch.tensor(X_tr_clin[train_mask], dtype=torch.float32).to(device)
+            X_tr_pca_t = torch.tensor(f_pca.transform(f_img_scaler.transform(X_tr_slices[train_mask])), dtype=torch.float32).to(device)
+            y_train_t = torch.tensor(y_tr_slices[train_mask], dtype=torch.float32).to(device)
 
-        mse_list.append(F.mse_loss(pred, y.squeeze(1)).item())
-        mae_list.append(torch.mean(torch.abs(pred - y.squeeze(1))).item())
+            X_val_clin_t = torch.tensor(X_tr_clin[val_mask], dtype=torch.float32).to(device)
+            X_val_pca_t = torch.tensor(f_pca.transform(f_img_scaler.transform(X_tr_slices[val_mask])), dtype=torch.float32).to(device)
+            y_val = y_tr_slices[val_mask]
 
-        y_true_list.append(y.cpu())
-        y_pred_list.append(pred.detach().cpu())
+            # Initialize Clinical Transformer
+            m_ct = CT_Class(n_inputs=X_tr_clin.shape[1]).to(device)
+            opt_ct = optim.Adam(m_ct.parameters(), lr=1e-4)
+            w = torch.where(y_train_t == 0, torch.tensor(NEG_WEIGHT, device=device), torch.tensor(SELECTED_POS_WEIGHT, device=device))
+            
+            # Pre-train Clinical Transformer
+            for _ in range(EPOCHS // 2):
+                m_ct.train()
+                opt_ct.zero_grad()
+                loss = criterion(m_ct(X_tr_clin_t + torch.randn_like(X_tr_clin_t) * JITTER_STD), y_train_t, weight=w)
+                loss.backward()
+                opt_ct.step()
+            
+            m_ct.eval()
+            for p in m_ct.parameters():
+                p.requires_grad_(False)
 
-    y_true_all = torch.cat(y_true_list).float()
-    y_pred_all = torch.cat(y_pred_list)
-    ss_res = torch.sum((y_true_all - y_pred_all)**2)
-    ss_tot = torch.sum((y_true_all - y_true_all.mean())**2)
-    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+            # Spectral ViT
+            vit_params = model_kwargs['vit'].copy()
+            vit_params['n_inputs'] = n_comp
+            
+            model = Wrapper_Class(
+                m_ct, 
+                ViT_Class(**vit_params)
+            ).to(device)
+            
+            optimizer = optim.Adam(model.m_res.parameters(), lr=5e-4)
 
-    return np.array([
-        np.mean(mse_list),
-        np.mean(mae_list),
-        r2.item()
-    ])
+            # Train Combined Model
+            for epoch in range(EPOCHS):
+                model.train()
+                optimizer.zero_grad()
+                loss = criterion(model(X_tr_pca_t, X_tr_clin_t), y_train_t, weight=w)
+                loss.backward()
+                optimizer.step()
 
-# -----------------------------------------------------
-# Diffusion + regression validation
-# -----------------------------------------------------
-@torch.no_grad()
-def val_model_regression_diffusion(loader, model, device, timesteps, alphas):
-    model.eval()
-    mse_list, mae_list = [], []
-    y_true_list, y_pred_list = [], []
+            # Evaluate
+            model.eval()
+            with torch.no_grad():
+                val_probs = model(X_val_pca_t, X_val_clin_t).cpu().numpy()
+                val_subj_probs = [val_probs[tr_subj_map[val_mask] == s].mean() for s in val_subjects]
+                val_subj_labels = [y_val[tr_subj_map[val_mask] == s][0] for s in val_subjects]
+                fold_aucs.append(roc_auc_score(val_subj_labels, val_subj_probs))
 
-    for x, y in loader:
-        x = x.to(device)
-        y = y.float().to(device).unsqueeze(1)
+        pca_results[n_comp] = fold_aucs
+        print(f"  PCA={n_comp}: AUC = {mean_std_str(fold_aucs)}")
 
-        # Sample random timestep and noise for diffusion input
-        t = torch.randint(0, timesteps, (x.size(0),), device=device)
-        noise = torch.randn_like(x)
-        x_noisy = q_sample(x, t, alphas, noise)
+    # Select best PCA components based on Mean AUC
+    N_PCA_COMPONENTS = pca_components_grid[np.argmax([np.mean(pca_results[n]) for n in pca_components_grid])]
+    print(f"Selected PCA components: {N_PCA_COMPONENTS}")
+    return N_PCA_COMPONENTS
 
-        # Forward
-        noise_pred, reg_pred = model(x_noisy, t)
-
-        mse_list.append(F.mse_loss(reg_pred, y).item())
-        mae_list.append(torch.mean(torch.abs(reg_pred - y)).item())
-
-        y_true_list.append(y.detach().cpu())
-        y_pred_list.append(reg_pred.detach().cpu())
-
-    # Compute R^2
-    y_true_all = torch.cat(y_true_list)
-    y_pred_all = torch.cat(y_pred_list)
-    ss_res = torch.sum((y_true_all - y_pred_all) ** 2)
-    ss_tot = torch.sum((y_true_all - y_true_all.mean()) ** 2)
-    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
-
-    return np.array([np.mean(mse_list), np.mean(mae_list), r2.item()])
-
-class ValLoaderWrapper:
-    def __init__(self, loader):
-        self.loader = loader
-        self.dataset = loader.dataset
-    def __iter__(self):
-        for batch in self.loader:
-            yield batch[:3]
-    def __len__(self):
-        return len(self.loader)
