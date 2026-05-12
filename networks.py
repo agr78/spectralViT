@@ -1,549 +1,625 @@
 import torch
 import torch.nn as nn
-import torch
-import torch.nn as nn
+import torch.nn.functional as F
+from scipy.fftpack import fft2, ifft2, fftshift, ifftshift
+from scipy.sparse.linalg import eigsh
+from scipy.sparse import csr_matrix, eye
+from sklearn.decomposition import PCA
+import numpy as np
+
+class SpectralViT(nn.Module):
+    def __init__(
+        self, 
+        n_inputs, 
+        n_heads=2, 
+        embed_dim=16, 
+        n_layers=4, 
+        patch_size=1,           # Optional
+        sampling_indices=None,  # Optional
+        use_rank_weights=True,  # Optional
+        use_mode_weights=False,
+        use_input_proj=True,    
+        use_pos_embed=True,     
+        pooling='mean',         
+        use_layer_norm=True,    
+        learnable_rank_weights=True,
+        use_sigmoid=False       
+    ):
+        super().__init__()
+        self.patch_size = patch_size
+        self.use_rank_weights = use_rank_weights
+        self.use_mode_weights = use_mode_weights
+        self.use_pos_embed = use_pos_embed
+        self.pooling = pooling
+        self.use_sigmoid = use_sigmoid
+        self.use_input_proj = use_input_proj
+
+        if sampling_indices is not None:
+            self.register_buffer('sampling_indices', sampling_indices)
+        else:
+            self.sampling_indices = None
+
+        # 1. Rank weights logic (1/f)
+        if use_rank_weights:
+            ranks = torch.arange(1, n_inputs + 1, dtype=torch.float32)
+            if learnable_rank_weights:
+                self.rank_weights = nn.Parameter(1.0 / ranks)
+            else:
+                self.register_buffer('rank_weights', 1.0 / ranks)
+
+        # 2. Projection Logic
+        self.d_model = embed_dim if (use_input_proj or use_mode_weights) else 1
+        
+        if self.use_mode_weights:
+            self.mode_weights = nn.Parameter(torch.randn(n_inputs, self.d_model) * 0.02)
+        elif self.use_input_proj:
+            self.input_proj = nn.Linear(patch_size, self.d_model)
+        else:
+            self.input_proj = nn.Identity()
+
+        # 3. Positional Embedding - Force (Seq, 1, Dim) for correct broadcasting
+        if self.use_pos_embed:
+            self.pos_embed = nn.Parameter(torch.randn(n_inputs, 1, self.d_model) * 0.02)
+
+        # 4. Transformer
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model, nhead=n_heads, 
+            dim_feedforward=embed_dim * 2, dropout=0.1
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        # 5. Head
+        head_in = self.d_model if pooling == 'mean' else (self.d_model * n_inputs)
+        if use_layer_norm:
+            self.mlp_head = nn.Sequential(nn.LayerNorm(head_in), nn.Linear(head_in, 1))
+        else:
+            self.mlp_head = nn.Linear(head_in, 1)
+
+    def forward(self, x, return_logit=False):
+        if x.ndim == 1: x = x.unsqueeze(0)
+        b = x.shape[0]
+
+        # A. Optional Sampling
+        if self.sampling_indices is not None:
+            x = x.view(b, -1)[:, self.sampling_indices]
+
+        # B. Rank Weights
+        if self.use_rank_weights:
+            # Slice rank_weights in case input x is shorter than n_inputs
+            x = x * self.rank_weights[:x.size(1)]
+        
+        # C. Projection Branching
+        if self.use_mode_weights:
+            # [Batch, Seq] -> [Batch, Seq, 1]
+            x = x.unsqueeze(-1) 
+            # [Batch, Seq, 1] * [1, Seq, Dim] -> [Batch, Seq, Dim]
+            x = x * self.mode_weights[:x.size(1), :].unsqueeze(0)
+            # -> [Seq, Batch, Dim]
+            x = x.transpose(0, 1)
+        else:
+            # [Batch, Seq] -> [Batch, Seq, Patch]
+            x = x.view(b, -1, self.patch_size)
+            # [Batch, Seq, Dim] -> [Seq, Batch, Dim]
+            x = self.input_proj(x).transpose(0, 1)
+        
+        # D. Position Addition (Safely Broadcasted)
+        if self.use_pos_embed:
+            # Ensure pos_embed matches sequence length and broadcasts over batch (dim 1)
+            x = x + self.pos_embed[:x.size(0), :, :]
+            
+        x = self.transformer(x)
+        
+        # E. Pooling
+        if self.pooling == 'mean':
+            x = x.mean(dim=0)
+        else:
+            # Result: [Batch, Seq * Dim]
+            x = x.transpose(0, 1).flatten(1)
+            
+        logit = self.mlp_head(x).squeeze(-1)
+        if logit.ndim == 0: logit = logit.unsqueeze(0)
+        if self.use_sigmoid and not return_logit:
+            return torch.sigmoid(logit)
+        return logit
+
+# class SpectralViT(nn.Module):
+#     """
+#     Fully Unified Spectral ViT.
+#     Works for:
+#     1. Simulation script (needs learnable_rank_weights=False, use_layer_norm=False)
+#     2. Medical script (needs use_input_proj, use_pos_embed, use_mode_weights)
+#     """
+#     def __init__(
+#         self, 
+#         n_inputs, 
+#         n_heads=2, 
+#         embed_dim=16, 
+#         n_layers=4, 
+#         use_mode_weights=False,
+#         use_input_proj=True,    # Restored
+#         use_pos_embed=True,     # Restored
+#         pooling='mean',         
+#         use_layer_norm=True,    
+#         learnable_rank_weights=True,
+#         use_sigmoid=False       
+#     ):
+#         super().__init__()
+#         self.use_mode_weights = use_mode_weights
+#         self.use_pos_embed = use_pos_embed
+#         self.pooling = pooling
+#         self.use_sigmoid = use_sigmoid
+#         self.use_input_proj = use_input_proj
+
+#         # 1. Spectral decay (1/f) logic
+#         ranks = torch.arange(1, n_inputs + 1, dtype=torch.float32)
+#         if learnable_rank_weights:
+#             self.rank_weights = nn.Parameter(1.0 / ranks)
+#         else:
+#             self.register_buffer('rank_weights', 1.0 / ranks)
+
+#         # 2. Input Projection Logic
+#         # DBS/IXI behavior uses d_model=1 or d_model=embed_dim
+#         self.d_model = embed_dim if (use_input_proj or use_mode_weights) else 1
+
+#         if self.use_mode_weights:
+#             self.mode_weights = nn.Parameter(torch.randn(n_inputs, self.d_model) * 0.02)
+#         elif self.use_input_proj:
+#             self.input_proj = nn.Linear(1, self.d_model)
+#         else:
+#             self.input_proj = nn.Identity()
+
+#         # 3. Positional Embedding Logic
+#         if self.use_pos_embed:
+#             self.pos_embed = nn.Parameter(torch.randn(n_inputs, 1, self.d_model) * 0.02)
+
+#         # 4. Transformer
+#         encoder_layer = nn.TransformerEncoderLayer(
+#             d_model=self.d_model, 
+#             nhead=n_heads, 
+#             dim_feedforward=embed_dim * 2, 
+#             dropout=0.1
+#         )
+#         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+#         # 5. Head Logic
+#         head_in = self.d_model if pooling == 'mean' else (self.d_model * n_inputs)
+        
+#         if use_layer_norm:
+#             self.mlp_head = nn.Sequential(nn.LayerNorm(head_in), nn.Linear(head_in, 1))
+#         else:
+#             self.mlp_head = nn.Linear(head_in, 1)
+
+#     def forward(self, x, return_logit=False):
+#         if x.ndim == 1: x = x.unsqueeze(0)
+        
+#         # Apply 1/f weighting
+#         x = x * self.rank_weights
+        
+#         # Apply Projection
+#         if self.use_mode_weights:
+#             x = x.unsqueeze(-1) * self.mode_weights.unsqueeze(0)
+#             x = x.transpose(0, 1)
+#         else:
+#             # Result: [seq_len, batch, d_model]
+#             x = self.input_proj(x.unsqueeze(-1)).transpose(0, 1)
+        
+#         # Add Position
+#         if self.use_pos_embed:
+#             x = x + self.pos_embed
+            
+#         x = self.transformer(x)
+        
+#         # Pooling
+#         if self.pooling == 'mean':
+#             x = x.mean(dim=0)
+#         else:
+#             x = x.transpose(0, 1).flatten(1)
+            
+#         logit = self.mlp_head(x).squeeze(-1)
+#         if logit.ndim == 0: logit = logit.unsqueeze(0)
+
+#         if self.use_sigmoid and not return_logit:
+#             return torch.sigmoid(logit)
+#         return logit
+    
+class SpatialViT(nn.Module):
+    def __init__(self, size=96, vol_size=None, patch_size=12, embed_dim=128, n_heads=4, n_layers=2, 
+                 dropout=0.2, is_2d=False, use_cls_token=True, use_layer_norm=True, use_sigmoid=False):
+        super().__init__()
+        actual_size = vol_size if vol_size is not None else size
+        self.patch_size = patch_size
+        self.is_2d = is_2d
+        self.use_cls_token = use_cls_token
+        self.use_sigmoid = use_sigmoid
+        
+        # Calculate patches based on init size
+        if is_2d:
+            self.n_patches = (actual_size // patch_size) ** 2
+            proj_in = patch_size ** 2
+        else:
+            self.n_patches = (actual_size // patch_size) ** 3
+            proj_in = patch_size ** 3
+
+        self.proj = nn.Linear(proj_in, embed_dim)
+        
+        # Positional Embedding (Seq, 1, Dim)
+        pos_len = self.n_patches + 1 if use_cls_token else self.n_patches
+        self.pos_embed = nn.Parameter(torch.randn(pos_len, 1, embed_dim) * 0.02)
+
+        if use_cls_token:
+            self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=n_heads, dim_feedforward=embed_dim * 2, dropout=dropout
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        if use_layer_norm:
+            self.head = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+        else:
+            self.head = nn.Linear(embed_dim, 1)
+
+    def forward(self, x, return_logit=False):
+        b = x.shape[0]
+        p = self.patch_size
+        
+        # 1. Dynamic Unfolding
+        if self.is_2d:
+            x = x.unfold(2, p, p).unfold(3, p, p)
+        else:
+            x = x.unfold(2, p, p).unfold(3, p, p).unfold(4, p, p)
+
+        # 2. View using -1 to handle any input volume size dynamically
+        # Shape: [Batch, n_patches, proj_in]
+        x = x.contiguous().view(b, -1, self.proj.in_features)
+        x = self.proj(x).transpose(0, 1) # [Seq, Batch, Dim]
+
+        # 3. CLS Token
+        if self.use_cls_token:
+            cls_tokens = self.cls_token.expand(1, b, -1)
+            x = torch.cat((cls_tokens, x), dim=0)
+
+        # 4. DYNAMIC POSITION INTERPOLATION (The Fix)
+        if x.size(0) != self.pos_embed.size(0):
+            # [Old_Seq, 1, Dim] -> [1, Dim, Old_Seq]
+            pe = self.pos_embed.permute(1, 2, 0)
+            # Interpolate to New_Seq
+            pe = F.interpolate(pe, size=x.size(0), mode='linear', align_corners=False)
+            # -> [New_Seq, 1, Dim]
+            x = x + pe.permute(2, 0, 1)
+        else:
+            x = x + self.pos_embed
+
+        x = self.transformer(x)
+
+        x_pool = x[0] if self.use_cls_token else x.mean(dim=0)
+        logit = self.head(x_pool).squeeze(-1)
+        
+        if logit.ndim == 0: logit = logit.unsqueeze(0)
+        if self.use_sigmoid and not return_logit:
+            return torch.sigmoid(logit)
+        return logit
+
+# class SpatialViT(nn.Module):
+#     """
+#     Unified Spatial ViT.
+#     DBS behavior: is_2d=True, use_cls_token=False (uses mean)
+#     IXI behavior: is_2d=False, use_cls_token=True, vol_size=96
+#     """
+#     def __init__(self, size=96, vol_size=None, patch_size=12, embed_dim=128, n_heads=4, n_layers=2, 
+#                  dropout=0.2, is_2d=False, use_cls_token=True, use_layer_norm=True, use_sigmoid=False):
+#         super().__init__()
+#         # Compatibility for 'size' (DBS) vs 'vol_size' (IXI)
+#         actual_size = vol_size if vol_size is not None else size
+#         self.patch_size = patch_size
+#         self.is_2d = is_2d
+#         self.use_cls_token = use_cls_token
+#         self.use_sigmoid = use_sigmoid
+        
+#         if is_2d:
+#             self.n_patches = (actual_size // patch_size) ** 2
+#             proj_in = patch_size ** 2
+#         else:
+#             self.n_patches = (actual_size // patch_size) ** 3
+#             proj_in = patch_size ** 3
+
+#         self.proj = nn.Linear(proj_in, embed_dim)
+        
+#         if use_cls_token:
+#             self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+#             pos_len = self.n_patches + 1
+#         else:
+#             pos_len = self.n_patches
+
+#         self.pos_embed = nn.Parameter(torch.randn(pos_len, 1, embed_dim) * 0.02)
+
+#         encoder_layer = nn.TransformerEncoderLayer(
+#             d_model=embed_dim, nhead=n_heads, dim_feedforward=embed_dim * 2, dropout=dropout
+#         )
+#         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+#         if use_layer_norm:
+#             self.head = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
+#         else:
+#             self.head = nn.Linear(embed_dim, 1)
+
+#     def forward(self, x, return_logit=False):
+#         b = x.shape[0]
+#         p = self.patch_size
+#         if self.is_2d:
+#             x = x.unfold(2, p, p).unfold(3, p, p)
+#         else:
+#             x = x.unfold(2, p, p).unfold(3, p, p).unfold(4, p, p)
+
+#         x = self.proj(x.contiguous().view(b, self.n_patches, -1)).transpose(0, 1)
+
+#         if self.use_cls_token:
+#             cls_tokens = self.cls_token.expand(1, b, -1)
+#             x = torch.cat((cls_tokens, x), dim=0)
+
+#         x = x + self.pos_embed
+#         x = self.transformer(x)
+
+#         x_pool = x[0] if self.use_cls_token else x.mean(dim=0)
+#         logit = self.head(x_pool).squeeze(-1)
+        
+#         if logit.ndim == 0: logit = logit.unsqueeze(0)
+#         if self.use_sigmoid and not return_logit:
+#             return torch.sigmoid(logit)
+#         return logit
+
 
 class ClinicalTransformer(nn.Module):
+    """DBS Logic: Each feature = One token."""
     def __init__(self, n_inputs, embed_dim=32, n_heads=4, n_layers=2):
         super().__init__()
         self.embedding = nn.Linear(1, embed_dim)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=n_heads, dim_feedforward=embed_dim*2)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=n_heads, dim_feedforward=embed_dim*2, dropout=0.1)
+        self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
         self.fc = nn.Linear(embed_dim * n_inputs, 1)
 
-    def forward(self, x, return_logit=False, **kwargs):
+    def forward(self, x, return_logit=False):
         if x.ndim == 1: x = x.unsqueeze(0)
-        x = x.unsqueeze(-1)
-        x = self.embedding(x)
-        x = x.permute(1, 0, 2)
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2).flatten(1)
+        x = self.embedding(x.unsqueeze(-1)).permute(1,0,2)
+        x = self.transformer(x).permute(1,0,2).flatten(1)
         logit = self.fc(x).squeeze()
-        if logit.ndim == 0: logit = logit.unsqueeze(0) # handle single-sample batch
+        if logit.ndim == 0: logit = logit.unsqueeze(0)
         return logit if return_logit else torch.sigmoid(logit)
-
-class SequentialSpectralAttention(nn.Module):
-    def __init__(self, n_components, n_clinical, embed_dim=32, n_heads=4, tau_0=16, alpha_0=0.1):
-        super().__init__()
-        self.n_components = n_components
-        self.n_clinical = n_clinical
-        self.tau_0 = tau_0
-        self.alpha_0 = alpha_0
-        
-        # Projections
-        self.input_projection = nn.Linear(1, embed_dim)
-        self.clin_embedders = nn.ModuleList([nn.Linear(1, embed_dim) for _ in range(n_clinical)])
-        # Step 1: Spectral Self-Attention (Modeling inter-component dependencies)
-        self.self_attn_spec = nn.MultiheadAttention(embed_dim, n_heads)
-        # Step 2: Cross-Attention (Clinical queries the refined Spectral library)
-        self.cross_attn = nn.MultiheadAttention(embed_dim, n_heads)
-        # Projects attended context back to match clinical input scalar
-        self.output_projection = nn.Linear(embed_dim, 1)
-        # Learnable hierarchy weight for PCA components
-        self.hierarchy_weight = nn.Parameter(
-            torch.exp(-torch.arange(n_components).float() / self.tau_0).view(1, -1, 1)
-        )
-        # Learnable gating parameter for the clinical update
-        self.gate = nn.Parameter(torch.tensor([self.alpha_0]))
-
-    def forward(self, x, skip_clin=False):
-        B = x.shape[0]
-        # --- PHASE 1: Spectral Manifold Encoding ---
-        # Prepare Spectral Library
-        pca_raw = x[:, :self.n_components].unsqueeze(-1) # [B, N_comp, 1]
-        h_spec = self.input_projection(pca_raw * self.hierarchy_weight) # [B, N_comp, Dim]
-        # Spectral Self-Attention (B, N, E) -> (N, B, E)
-        h_spec_t = h_spec.transpose(0, 1)
-        # Components "talk" to each other to capture non-linear anatomical context
-        h_spec_refined_t, _ = self.self_attn_spec(h_spec_t, h_spec_t, h_spec_t)
-        # If no clinical data, return the spectral path only (or as configured)
-        if skip_clin or self.n_clinical == 0:
-            # Note: You may want to project h_spec_refined back to 1D if skipping
-            return x
-        # --- PHASE 2: Clinical-Gated Extraction ---
-        # Prepare Clinical Path (Queries)
-        clin_raw = x[:, self.n_components:] # [B, N_clin]
-        h_clin = torch.stack([
-            self.clin_embedders[i](clin_raw[:, i:i+1]) for i in range(self.n_clinical)
-        ], dim=1) # [B, N_clin, Dim]
-        # Cross-Attention: Clinical (Q) attends to Refined Spectral (K, V)
-        q = h_clin.transpose(0, 1)           # [N_clin, B, Dim]
-        k = v = h_spec_refined_t             # [N_comp, B, Dim]
-        # Resulting attn_out_t has shape [N_clin, B, Dim]
-        attn_out_t, _ = self.cross_attn(query=q, key=k, value=v)
-        h_out = attn_out_t.transpose(0, 1)    # [B, N_clin, Dim]
-        # --- PHASE 3: Gated Residual Update ---
-        # Project attended context back to scalar dimension for residual addition
-        clinical_context = self.output_projection(h_out).squeeze(-1) # [B, N_clin]
-        # Update only the clinical portion of the feature vector
-        clin_out = clin_raw + self.gate * clinical_context
-        # Final output: [Original PCA components, Updated Clinical variables]
-        return torch.cat([x[:, :self.n_components], clin_out], dim=1)
-
-class GatedCrossSpectralAttention(nn.Module):
-    def __init__(self, n_components, n_clinical, embed_dim=32, n_heads=4, tau_0=16, alpha_0=0.1):
-        super().__init__()
-        self.n_components = n_components
-        self.n_clinical = n_clinical
-        self.tau_0 = tau_0
-        self.alpha_0 = alpha_0
-        
-        # Projections
-        self.input_projection = nn.Linear(1, embed_dim)
-        self.clin_embedders = nn.ModuleList([nn.Linear(1, embed_dim) for _ in range(n_clinical)])
-        
-        # Cross-Attention: Clinical queries the Spectral library
-        self.mha = nn.MultiheadAttention(embed_dim, n_heads)
-        
-        # Projects attended context back to match clinical input (1 feature per token)
-        self.output_projection = nn.Linear(embed_dim, 1)
-        
-        # Learnable hierarchy weight for PCA components
-        self.hierarchy_weight = nn.Parameter(
-            torch.exp(-torch.arange(n_components).float() / self.tau_0).view(1, -1, 1)
-        )
-        
-        # Learnable gating parameter
-        self.gate = nn.Parameter(torch.tensor([self.alpha_0]))
-
-    def forward(self, x, skip_clin=False):
-        B = x.shape[0]
-        
-        # 1. Prepare Spectral Library (Keys & Values)
-        pca_raw = x[:, :self.n_components].unsqueeze(-1) # [B, N_comp, 1]
-        h_spec = self.input_projection(pca_raw * self.hierarchy_weight) # [B, N_comp, Dim]
-        
-        # If no clinical data, cross-attention cannot occur; return original x
-        if skip_clin or self.n_clinical == 0:
-            return x
-
-        # 2. Prepare Clinical Path (Queries)
-        clin_raw = x[:, self.n_components:] # [B, N_clin]
-        h_clin = torch.stack([
-            self.clin_embedders[i](clin_raw[:, i:i+1]) for i in range(self.n_clinical)
-        ], dim=1) # [B, N_clin, Dim]
-        
-        # 3. Cross-Attention: Clinical (Q) attends to Spectral (K, V)
-        # MultiheadAttention expects (S, B, E)
-        q = h_clin.transpose(0, 1)      # [N_clin, B, Dim]
-        k = v = h_spec.transpose(0, 1)  # [N_comp, B, Dim]
-        
-        # Resulting attn_out_t has shape [N_clin, B, Dim]
-        attn_out_t, _ = self.mha(query=q, key=k, value=v)
-        h_out = attn_out_t.transpose(0, 1) # [B, N_clin, Dim]
-        
-        # 4. Gated Residual Update on Clinical Path
-        # The context is now a clinical-aligned representation of spectral data
-        clinical_context = self.output_projection(h_out).squeeze(-1) # [B, N_clin]
-        
-        # Update the clinical portion of the vector
-        clin_out = clin_raw + self.gate * clinical_context
-        
-        # Return PCA components (unchanged) concatenated with updated clinical data
-        return torch.cat([x[:, :self.n_components], clin_out], dim=1)
-
-class GatedSpectralAttention(nn.Module):
-    def __init__(self, n_components, n_clinical, embed_dim=32, n_heads=4, tau_0=16, alpha_0=0.1):
-        super().__init__()
-        self.n_components = n_components
-        self.n_clinical = n_clinical
-        self.tau_0 = tau_0
-        self.alpha_0 = alpha_0
-        self.input_projection = nn.Linear(1, embed_dim)
-        self.clin_embedders = nn.ModuleList([nn.Linear(1, embed_dim) for _ in range(n_clinical)])
-        
-        self.mha = nn.MultiheadAttention(embed_dim, n_heads)
-        self.output_projection = nn.Linear(embed_dim, 1)
-        
-        # Learnable hierarchy weight
-        self.hierarchy_weight = nn.Parameter(torch.exp(-torch.arange(n_components).float() / self.tau_0).view(1, -1, 1))
-        
-        # Learnable gating parameter initialized at 0.1
-        self.gate = nn.Parameter(torch.tensor([self.alpha_0]))
-
-    def forward(self, x, skip_clin=False):
-        B = x.shape[0]
-        pca_raw = x[:, :self.n_components].unsqueeze(-1) # [B, N, 1]
-        h_spec = self.input_projection(pca_raw * self.hierarchy_weight) # [B, N, Dim]
-        
-        if not skip_clin:
-            clin_raw = x[:, self.n_components:] 
-            h_clin = torch.stack([self.clin_embedders[i](clin_raw[:, i:i+1]) for i in range(self.n_clinical)], dim=1)
-            tokens = torch.cat([h_spec, h_clin], dim=1)
-        else:
-            tokens = h_spec
-            
-        # MHA Manual Transpose (B, S, E) -> (S, B, E)
-        tokens_t = tokens.transpose(0, 1)
-        attn_out_t, _ = self.mha(tokens_t, tokens_t, tokens_t)
-        h_out = attn_out_t.transpose(0, 1)
-        
-        # Extract PCA context
-        spectral_context = self.output_projection(h_out[:, :self.n_components, :])
-        
-        # Use learnable gate instead of fixed 0.1
-        pca_out = (pca_raw + self.gate * spectral_context).squeeze(-1)
-        
-        if skip_clin: return pca_out
-        return torch.cat([pca_out, x[:, self.n_components:]], dim=1)
-
-class EnhancedSpatialAttention(nn.Module):
-    def __init__(self, img_dim=64, patch_size=16, n_clinical=6, embed_dim=16, n_heads=4, target_dim=128):
-        super().__init__()
-        self.img_dim = img_dim
-        self.patch_size = patch_size
-        self.n_patches = (img_dim // patch_size) ** 2 
-        self.n_clinical = n_clinical
-        
-        self.patch_projection = nn.Linear(patch_size**2, embed_dim)
-        self.clin_embedders = nn.ModuleList([nn.Linear(1, embed_dim) for _ in range(n_clinical)])
-        
-        # Positional embeddings for patches + clinical tokens
-        self.pos_embedding = nn.Parameter(torch.randn(1, self.n_patches + n_clinical, embed_dim))
-        
-        # Standard MHA (No batch_first for compatibility)
-        self.mha = nn.MultiheadAttention(embed_dim, n_heads)
-        self.bottleneck = nn.Linear(self.n_patches * embed_dim, target_dim)
-
-    def forward(self, x, skip_clin=False):
-        B = x.shape[0]
-        
-        # 1. Image Tokenization
-        x_img_raw = x[:, :self.img_dim**2]
-        x_img = x_img_raw.view(B, 1, self.img_dim, self.img_dim)
-        patches = x_img.unfold(2, self.patch_size, self.patch_size)\
-                       .unfold(3, self.patch_size, self.patch_size)\
-                       .contiguous().view(B, self.n_patches, -1)
-        h_patches = self.patch_projection(patches) # (B, n_patches, embed_dim)
-        
-        if not skip_clin:
-            # 2. Atomic Clinical Tokenization
-            x_clin = x[:, self.img_dim**2:]
-            h_clin = torch.stack([self.clin_embedders[i](x_clin[:, i:i+1]) for i in range(self.n_clinical)], dim=1)
-            tokens = torch.cat([h_clin, h_patches], dim=1)
-            tokens = tokens + self.pos_embedding
-        else:
-            tokens = h_patches + self.pos_embedding[:, self.n_clinical:, :]
-        
-        # 3. MHA with Manual Transpose (B, S, E) -> (S, B, E)
-        tokens_t = tokens.transpose(0, 1)
-        attn_out_t, _ = self.mha(tokens_t, tokens_t, tokens_t)
-        h_out = attn_out_t.transpose(0, 1) # Back to (B, S, E)
-        
-        # 4. Extract Patches
-        start_idx = self.n_clinical if not skip_clin else 0
-        spatial_refined = h_out[:, start_idx:, :].reshape(B, -1)
-        spatial_compressed = self.bottleneck(spatial_refined)
-        
-        if skip_clin: return spatial_compressed
-        return torch.cat([spatial_compressed, x_clin], dim=1)
-
-class EnhancedSpectralAttention(nn.Module):
-    def __init__(self, n_components, n_clinical, embed_dim=32, n_heads=4):
-        super().__init__()
-        self.n_components = n_components
-        self.n_clinical = n_clinical
-        
-        self.input_projection = nn.Linear(1, embed_dim)
-        self.clin_embedders = nn.ModuleList([nn.Linear(1, embed_dim) for _ in range(n_clinical)])
-        
-        self.mha = nn.MultiheadAttention(embed_dim, n_heads)
-        self.output_projection = nn.Linear(embed_dim, 1)
-        
-        # Learnable hierarchy weight
-        self.hierarchy_weight = nn.Parameter(torch.exp(-torch.arange(n_components).float() / 16).view(1, -1, 1))
-
-    def forward(self, x, skip_clin=False):
-        B = x.shape[0]
-        pca_raw = x[:, :self.n_components].unsqueeze(-1) # [B, N, 1]
-        h_spec = self.input_projection(pca_raw * self.hierarchy_weight) # [B, N, Dim]
-        
-        if not skip_clin:
-            clin_raw = x[:, self.n_components:] 
-            h_clin = torch.stack([self.clin_embedders[i](clin_raw[:, i:i+1]) for i in range(self.n_clinical)], dim=1)
-            tokens = torch.cat([h_spec, h_clin], dim=1)
-        else:
-            tokens = h_spec
-            
-        # MHA Manual Transpose (B, S, E) -> (S, B, E)
-        tokens_t = tokens.transpose(0, 1)
-        attn_out_t, _ = self.mha(tokens_t, tokens_t, tokens_t)
-        h_out = attn_out_t.transpose(0, 1)
-        
-        # Extract PCA context
-        spectral_context = self.output_projection(h_out[:, :self.n_components, :])
-        pca_out = (pca_raw + 0.1 * spectral_context).squeeze(-1)
-        
-        if skip_clin: return pca_out
-        return torch.cat([pca_out, x[:, self.n_components:]], dim=1)
-
-class MinimalSpectralAttention(nn.Module):
-    def __init__(self, n_components, n_clinical, embed_dim=16, n_heads=4):
-        super().__init__()
-        self.n_components = n_components
-        
-        # Projections for both types of tokens
-        self.input_projection = nn.Linear(1, embed_dim)
-        self.clin_projection = nn.Linear(n_clinical, embed_dim) # New: Clinical Projector
-        
-        self.mha = nn.MultiheadAttention(embed_dim, n_heads)
-        self.output_projection = nn.Linear(embed_dim, 1)
-        
-        indices = torch.arange(n_components).float()
-        self.register_buffer('hierarchy_weight', torch.exp(-indices / 32).view(1, -1, 1))
-
-    def forward(self, x, skip_clin=False):
-        if skip_clin:
-            # FIX: Only take the first 128 dimensions (PCA) for hierarchy weighting
-            pca_raw = x[:, :self.n_components].unsqueeze(-1) 
-            h_spec = self.input_projection(pca_raw * self.hierarchy_weight)
-            h = h_spec.transpose(0, 1)
-            attn_out, _ = self.mha(h, h, h)
-            # Return only the PCA part (128)
-            return (pca_raw + 0.1 * self.output_projection(attn_out.transpose(0, 1))).squeeze(-1)
-        # 1. Split data
-        pca_raw = x[:, :self.n_components].unsqueeze(-1) 
-        clin_raw = x[:, self.n_components:]
-        
-        # 2. Project Spectral Tokens
-        h_spec = self.input_projection(pca_raw * self.hierarchy_weight) # (B, N_PCA, Dim)
-        
-        # 3. Project Clinical Data into a single "Global Context Token"
-        h_clin = self.clin_projection(clin_raw).unsqueeze(1) # (B, 1, Dim)
-        
-        # 4. Concatenate: Now the sequence is [Spectral_1, ..., Spectral_N, Clinical_Token]
-        combined_tokens = torch.cat([h_spec, h_clin], dim=1)
-        
-        # 5. Multi-Head Attention (Self-Attention across all tokens)
-        h = combined_tokens.transpose(0, 1) 
-        attn_out, _ = self.mha(h, h, h)
-        h_out = attn_out.transpose(0, 1)
-        
-        # 6. Extract the Spectral part back out and project back to raw PCA space
-        spectral_context = self.output_projection(h_out[:, :self.n_components, :])
-        pca_out = (pca_raw + 0.1 * spectral_context).squeeze(-1) 
-        
-        # We return the original clinical features + the refined PCA
-        return torch.cat([pca_out, clin_raw], dim=1)
     
-class MiniSpatialAttention(nn.Module):
-    def __init__(self, img_dim=64, patch_size=16, n_clinical=5, embed_dim=16, n_heads=4, target_dim=128):
-        super().__init__()
-        self.img_dim = img_dim
-        self.patch_size = patch_size
-        self.n_patches = (img_dim // patch_size) ** 2 
-        
-        # Projections
-        self.patch_projection = nn.Linear(patch_size**2, embed_dim)
-        self.clin_projection = nn.Linear(n_clinical, embed_dim) # Clinical -> Embedding
-        
-        # Spatial Awareness
-        self.pos_embedding = nn.Parameter(torch.randn(1, self.n_patches + 1, embed_dim)) # +1 for clinical token
-        self.mha = nn.MultiheadAttention(embed_dim, n_heads)
-        
-        # Bottleneck to keep VAE input consistent (128 + n_clinical)
-        self.bottleneck = nn.Linear(self.n_patches * embed_dim, target_dim)
 
-    def forward(self, x, skip_clin=False):
-        B = x.shape[0]
-        if skip_clin:
-            # Pretraining Mode: x is [B, Pixels]
-            x_img_raw = x[:, :self.img_dim**2] 
-            x_img = x_img_raw.view(B, 1, self.img_dim, self.img_dim)
-            patches = x_img.unfold(2, self.patch_size, self.patch_size)\
-                           .unfold(3, self.patch_size, self.patch_size)\
-                           .contiguous().view(B, self.n_patches, -1)
-            h_patches = self.patch_projection(patches)
-            # Use only patch pos embeddings (indices 1 to N)
-            combined = h_patches + self.pos_embedding[:, 1:, :]
-            h = combined.transpose(0, 1)
-            attn_out, _ = self.mha(h, h, h)
-            spatial_refined = attn_out.transpose(0, 1).reshape(B, -1)
-            return self.bottleneck(spatial_refined)
-        # 1. Unpack Raw Pixels and Clinical Data
-        x_img_raw = x[:, :self.img_dim**2]
-        x_clin = x[:, self.img_dim**2:]
-        B = x_img_raw.shape[0]
-        
-        # 2. Tokenize Image Patches
-        x_img = x_img_raw.view(B, 1, self.img_dim, self.img_dim)
-        patches = x_img.unfold(2, self.patch_size, self.patch_size)\
-                       .unfold(3, self.patch_size, self.patch_size)\
-                       .contiguous().view(B, self.n_patches, -1)
-        h_patches = self.patch_projection(patches) # (B, n_patches, embed_dim)
-        
-        # 3. Project Clinical Context Token
-        h_clin = self.clin_projection(x_clin).unsqueeze(1) # (B, 1, embed_dim)
-        
-        # 4. Concatenate: [Clinical Token, Patch 1, ..., Patch N]
-        # Adding position embeddings to everything
-        combined = torch.cat([h_clin, h_patches], dim=1) + self.pos_embedding
-        
-        # 5. Multi-Head Attention
-        # Now every patch "sees" the clinical data during the attention sweep
-        h = combined.transpose(0, 1)
-        attn_out, _ = self.mha(h, h, h)
-        h_out = attn_out.transpose(0, 1)
-        
-        # 6. Separate and Refine
-        # We extract the patches back out to go through the bottleneck
-        spatial_refined = h_out[:, 1:, :].reshape(B, -1)
-        spatial_compressed = self.bottleneck(spatial_refined)
-        
-        # Return compressed spatial features + original clinical features for the VAE
-        return torch.cat([spatial_compressed, x_clin], dim=1)
-
-class SpectralAttention(nn.Module):
-    def __init__(self, n_components, embed_dim=16, n_heads=4):
+class ResidualSpectral(nn.Module):
+    def __init__(self, m_ct, m_res):
         super().__init__()
-        self.n_components = n_components
-        self.input_projection = nn.Linear(1, embed_dim)
-        self.mha = nn.MultiheadAttention(embed_dim, n_heads)
-        self.output_projection = nn.Linear(embed_dim, 1)
+        self.m_ct, self.m_res = m_ct, m_res
+    def forward(self, x_res, x_clin, return_logit=False):
+        with torch.no_grad():
+            l_clin = self.m_ct(x_clin, return_logit=True)
+        l_res = self.m_res(x_res, return_logit=True)
+        joint = l_clin + l_res
+        return joint if return_logit else torch.sigmoid(joint)
+    
+
+class ResidualSpatial(nn.Module):
+    def __init__(self, m_ct, m_res):
+        super().__init__()
+        self.m_ct, self.m_res = m_ct, m_res
+    def forward(self, x_res, x_clin, return_logit=False):
+        with torch.no_grad():
+            l_clin = self.m_ct(x_clin, return_logit=True)
+        l_res = self.m_res(x_res, return_logit=True)
+        joint = l_clin + l_res
+        return joint if return_logit else torch.sigmoid(joint)
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1, gamma=2):
+        super().__init__()
+        self.alpha, self.gamma = alpha, gamma
+    def forward(self, inputs, targets, weight=None):
+        bce = F.binary_cross_entropy(inputs, targets, weight=weight, reduction='none')
+        return (self.alpha * (1 - torch.exp(-bce))**self.gamma * bce).mean()
+
+class PassThrough(nn.Module):
+    def forward(self, x, **kwargs): return x
+
+
+class AttentionBlock(nn.Module):
+    def __init__(self, F_g=None, F_l=None, F_int=None, is_spatial_2d=False):
+        super(AttentionBlock, self).__init__()
+        self.is_spatial_2d = is_spatial_2d
         
-        # Fixed variance-based weighting (The Hierarchy Prior)
-        indices = torch.arange(n_components).float()
-        # Decay factor: PCA 1 stays strong, PCA 128 is suppressed
-        self.register_buffer('hierarchy_weight', torch.exp(-indices / 32).view(1, -1, 1))
+        if not is_spatial_2d:
+            # ORIGINAL 3D GATE
+            self.W_g = nn.Sequential(
+                nn.Conv3d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+                nn.BatchNorm3d(F_int)
+            )
+            self.W_x = nn.Sequential(
+                nn.Conv3d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+                nn.BatchNorm3d(F_int)
+            )
+            self.psi = nn.Sequential(
+                nn.Conv3d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+                nn.BatchNorm3d(1),
+                nn.Sigmoid()
+            )
+            self.relu = nn.ReLU(inplace=True)
+        else:
+            # EXACT FASTUNET SPATIAL ATTENTION
+            self.conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+            self.sigmoid = nn.Sigmoid()
+
+    def forward(self, g, x=None):
+        if self.is_spatial_2d:
+            # Logic: x * (1 + att)
+            avg_out = torch.mean(g, dim=1, keepdim=True)
+            max_out, _ = torch.max(g, dim=1, keepdim=True)
+            att = torch.cat([avg_out, max_out], dim=1)
+            att = self.sigmoid(self.conv(att))
+            return g * (1 + att)
+        else:
+            # Logic: x * psi
+            g1 = self.W_g(g)
+            x1 = self.W_x(x)
+            psi = self.relu(g1 + x1)
+            psi = self.psi(psi)
+            return x * psi
+
+class AttentionUNet(nn.Module):
+    def __init__(self, in_channels=1, base_channels=7, fast_mode=False, use_sigmoid=False):
+        super(AttentionUNet, self).__init__()
+        self.fast_mode = fast_mode
+        self.use_sigmoid = use_sigmoid
+
+        if not fast_mode:
+            # --- ORIGINAL 3D MODEL ---
+            self.conv1 = nn.Conv3d(in_channels, base_channels, kernel_size=3, padding=1, stride=2) 
+            self.conv2 = nn.Conv3d(base_channels, base_channels*2, kernel_size=3, padding=1, stride=2) 
+            self.conv3 = nn.Conv3d(base_channels*2, base_channels*4, kernel_size=3, padding=1, stride=2) 
+            self.attn = AttentionBlock(base_channels*4, base_channels*4, base_channels*2, is_spatial_2d=False)
+            self.pool = nn.AdaptiveAvgPool3d(1)
+            self.classifier = nn.Linear(base_channels*4, 1)
+        else:
+            # --- EXACT FASTUNET REPLICA ---
+            def conv_block(in_c, out_c):
+                return nn.Sequential(
+                    nn.Conv2d(in_c, out_c, 3, padding=1, bias=False),
+                    nn.BatchNorm2d(out_c),
+                    nn.ReLU(inplace=True)
+                )
+            self.enc1 = conv_block(in_channels, base_channels)    # 16
+            self.enc2 = conv_block(base_channels, base_channels*2) # 32
+            self.pool2d = nn.MaxPool2d(2)
+            self.bottleneck = conv_block(base_channels*2, base_channels*4) # 64
+            
+            self.attn = AttentionBlock(is_spatial_2d=True)
+            self.gmp = nn.AdaptiveMaxPool2d(1)
+            self.fc = nn.Sequential(
+                nn.Linear(base_channels*4, base_channels*2), # 64 -> 32
+                nn.ReLU(inplace=True),
+                nn.Linear(base_channels*2, 1)                # 32 -> 1
+            )
+            nn.init.zeros_(self.fc[-1].weight)
+            nn.init.zeros_(self.fc[-1].bias)
+
+    def forward(self, x, return_logit=False):
+        if self.fast_mode:
+            # Replicating the 2-pool logic of FastUNet
+            if x.dim() == 5: x = x.mean(dim=2)
+            x1 = self.enc1(x)
+            x2 = self.enc2(self.pool2d(x1))
+            bn = self.bottleneck(self.pool2d(x2))
+            bn = self.attn(bn)
+            pooled = self.gmp(bn).view(x.size(0), -1)
+            logit = self.fc(pooled).squeeze(-1)
+        else:
+            x1 = F.relu(self.conv1(x))
+            x2 = F.relu(self.conv2(x1))
+            x3 = F.relu(self.conv3(x2))
+            g = self.attn(g=x3, x=x3)
+            out = self.pool(g).view(g.size(0), -1)
+            logit = self.classifier(out).squeeze(-1)
+
+        if logit.ndim == 0: logit = logit.unsqueeze(0)
+        if self.use_sigmoid and not return_logit:
+            return torch.sigmoid(logit)
+        return logit
+
+# Shifted window (Swin) transformer
+class SwinBlock(nn.Module):
+    def __init__(self, dim, input_resolution, num_heads, window_size=6, shift_size=0):
+        super().__init__()
+        self.dim, self.input_resolution = dim, input_resolution
+        self.window_size, self.shift_size = window_size, shift_size
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.TransformerEncoderLayer(d_model=dim, nhead=num_heads, dim_feedforward=dim*2, dropout=0.1)
+        self.norm2 = nn.LayerNorm(dim)
 
     def forward(self, x):
-        pca_raw = x[:, :self.n_components].unsqueeze(-1) 
-        clin_feats = x[:, self.n_components:]
-        
-        # 1. Project with hierarchy weighting
-        h = self.input_projection(pca_raw * self.hierarchy_weight) 
-        
-        # 2. Attention mechanism
-        h = h.transpose(0, 1) 
-        attn_out, _ = self.mha(h, h, h)
-        h_out = attn_out.transpose(0, 1)
-        
-        # 3. Residual spectral context (Nonlinear refinement)
-        spectral_context = self.output_projection(h_out)
-        # We only add 10% of the attention's "opinion" to keep the VAE stable
-        pca_out = (pca_raw + 0.1 * spectral_context).squeeze(-1) 
-        
-        return torch.cat([pca_out, clin_feats], dim=1)
+        H, W = self.input_resolution
+        B, L, C = x.shape
+        shortcut = x
+        x = self.norm1(x).view(B, H, W, C)
 
-class SpatialViT(nn.Module):
-    def __init__(self, image_size=128, patch_size=16, in_channels=1, num_classes=1, 
-                 dim=128, depth=4, heads=8, mlp_dim=256, dropout=0.1):
+        if self.shift_size > 0:
+            x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+
+        # Window Partitioning
+        x = x.view(B, H // self.window_size, self.window_size, W // self.window_size, self.window_size, C)
+        windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, self.window_size * self.window_size, C)
+
+        # Attention
+        attn_windows = self.attn(windows.transpose(0, 1)).transpose(0, 1)
+
+        # Merge Windows
+        x = attn_windows.view(B, H // self.window_size, W // self.window_size, self.window_size, self.window_size, C)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, C)
+
+        if self.shift_size > 0:
+            x = torch.roll(x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+
+        return shortcut + self.norm2(x.view(B, L, C))
+
+class SwinTransformer(nn.Module):
+    def __init__(self, img_size=96, patch_size=8, embed_dim=32, window_size=6):
         super().__init__()
-        assert image_size % patch_size == 0, "Image dimensions must be divisible by patch size."
-        num_patches = (image_size // patch_size) ** 2
-        self.to_patch_embedding = nn.Sequential(
-            nn.Conv2d(in_channels, dim, kernel_size=patch_size, stride=patch_size),
-            nn.Flatten(2),
-        )
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
-        self.dropout = nn.Dropout(dropout)
-        # REMOVED batch_first=True for backward compatibility
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=dim, nhead=heads, dim_feedforward=mlp_dim, 
-            dropout=dropout, activation='gelu'
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
-        self.mlp_head = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, num_classes),
-            nn.Sigmoid()
-        )
-    def forward(self, x, mode='fine_tune'):
-        p = self.to_patch_embedding(x).transpose(1, 2) # [Batch, Seq, Dim]
-        b, n, _ = p.shape
-        cls_tokens = self.cls_token.expand(b, -1, -1)
-        x = torch.cat((cls_tokens, p), dim=1)
-        x += self.pos_embedding
-        x = self.dropout(x)
-        # MANUALLY TRANSPOSE: Transformer expects [Seq, Batch, Dim]
-        x = x.transpose(0, 1) 
-        x = self.transformer(x)
-        x = x.transpose(0, 1) # Transpose back to [Batch, Seq, Dim]
-        cls_out = x[:, 0]
-        if mode == 'pretrain':
-            return None, cls_out # Decoder is handled externally in your script
-        return self.mlp_head(cls_out).squeeze(-1)
-    
-class FullSpectralAttention(nn.Module):
-    def __init__(self, n_components, embed_dim=16, n_heads=4):
-        super().__init__()
-        self.n_components = n_components
-        self.input_projection = nn.Linear(1, embed_dim)
-        self.mha = nn.MultiheadAttention(embed_dim, n_heads)
-        self.norm = nn.LayerNorm(embed_dim)
-        self.output_projection = nn.Linear(embed_dim, 1)
+        self.patch_embed = nn.Conv2d(1, embed_dim, kernel_size=patch_size, stride=patch_size)
+        res = img_size // patch_size
+        self.layers = nn.ModuleList([
+            SwinBlock(embed_dim, (res, res), num_heads=4, window_size=window_size, shift_size=0),
+            SwinBlock(embed_dim, (res, res), num_heads=4, window_size=window_size, shift_size=window_size // 2)
+        ])
+        self.head = nn.Linear(embed_dim, 1)
 
     def forward(self, x):
-        pca_feats = x[:, :self.n_components].unsqueeze(-1) 
-        clin_feats = x[:, self.n_components:]
-        h = self.input_projection(pca_feats) 
-        h = h.transpose(0, 1) 
-        attn_out, _ = self.mha(h, h, h)
-        h = self.norm(h + attn_out)
-        h = h.transpose(0, 1) 
-        pca_out = self.output_projection(h).squeeze(-1) 
-        return torch.cat([pca_out, clin_feats], dim=1)
+        # Collapse 3D to 2D for Swin blocks
+        if x.dim() == 5: x = x.mean(dim=2) 
+        x = self.patch_embed(x).flatten(2).transpose(1, 2)
+        for layer in self.layers:
+            x = layer(x)
+        x = x.mean(dim=1) 
+        return self.head(x).squeeze(-1)
+    
+def pca_tokenize(img_size, X_train, img_test, k):
+    n_comp = min(k, X_train.shape[0])
+    pca = PCA(n_components=n_comp).fit(X_train)
+    tokens = pca.transform(img_test.flatten().reshape(1, -1))
+    img_recon = pca.inverse_transform(tokens).reshape(img_size, img_size)
+    return tokens.flatten(), img_recon
 
-class HybridAE(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.encoder = nn.Sequential(nn.Linear(input_dim, 128), nn.BatchNorm1d(128), nn.ReLU(), nn.Dropout(0.3), nn.Linear(128, 64))
-        self.decoder = nn.Sequential(nn.Linear(64, 128), nn.ReLU(), nn.Linear(128, input_dim))
-        self.classifier_head = nn.Sequential(nn.Linear(64, 32), nn.ReLU(), nn.Linear(32, 1), nn.Sigmoid())
-    def forward(self, x, mode='pretrain'):
-        latent = self.encoder(x)
-        return self.decoder(latent) if mode == 'pretrain' else self.classifier_head(latent).squeeze()
+def fourier_tokenize(img_size, img, k):
+    kspace = fftshift(fft2(img))
+    kspace_flat = kspace.flatten()
+    idx = np.argsort(np.abs(kspace_flat))[::-1]
+    kspace_recon = np.zeros_like(kspace_flat, dtype=complex)
+    kspace_recon[idx[:k]] = kspace_flat[idx[:k]]
+    img_recon = np.real(ifft2(ifftshift(kspace_recon.reshape(img_size, img_size))))
+    # Magnitude tokens provide translation invariance
+    return np.abs(kspace_flat[idx[:k]]), img_recon
 
-class SupervisedManifoldAE(nn.Module):
-    def __init__(self, input_dim, latent_dim=64):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.4),
-            nn.Linear(256, 128), nn.ReLU(), nn.Linear(128, latent_dim)
-        )
-        self.decoder = nn.Sequential(nn.Linear(latent_dim, 128), nn.ReLU(), nn.Linear(128, 256), nn.ReLU(), nn.Linear(256, input_dim))
-        self.classifier = nn.Sequential(nn.Linear(latent_dim, 32), nn.ReLU(), nn.Dropout(0.2), nn.Linear(32, 1), nn.Sigmoid())
-    def forward(self, x, mode='train'):
-        latent = self.encoder(x)
-        return self.decoder(latent) if mode == 'pretrain' else self.classifier(latent).squeeze()
+def laplacian_tokenize(img_size, img_clean, img_noisy, k, threshold=0.03, topo_labels=None):
+    n_pixels = img_size * img_size
+    img_flat = img_clean.flatten()
+    rows, cols, vals = [], [], []
+    
+    for i in range(n_pixels):
+        r, c = divmod(i, img_size)
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < img_size and 0 <= nc < img_size:
+                j = nr * img_size + nc
+                if topo_labels is not None:
+                    weight = 1.0 if topo_labels.flat[i] == topo_labels.flat[j] else 0.0001
+                else:
+                    weight = np.exp(-np.abs(img_flat[i] - img_flat[j])**2 / (2 * threshold**2))
+                rows.append(i); cols.append(j); vals.append(weight)
+    
+    W = csr_matrix((vals, (rows, cols)), shape=(n_pixels, n_pixels))
+    d = np.array(W.sum(axis=1)).flatten()
+    D_inv_sqrt = csr_matrix((np.power(d, -0.5, where=d!=0), (range(n_pixels), range(n_pixels))))
+    L = eye(n_pixels) - D_inv_sqrt @ W @ D_inv_sqrt
+    _, evecs = eigsh(L, k=k, which='SM')
+    tokens = evecs.T @ img_noisy.flatten()
+    img_recon = (evecs @ tokens).reshape(img_size, img_size)
+    return tokens, img_recon
 
-class SupervisedManifoldVAE(nn.Module):
-    def __init__(self, input_dim, latent_dim=64):
-        super().__init__()
-        self.encoder_base = nn.Sequential(
-            nn.Linear(input_dim, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.4),
-            nn.Linear(256, 128), nn.ReLU()
-        )
-        self.fc_mu = nn.Linear(128, latent_dim)
-        self.fc_logvar = nn.Linear(128, latent_dim)
-        
-        self.decoder = nn.Sequential(nn.Linear(latent_dim, 128), nn.ReLU(), nn.Linear(128, 256), nn.ReLU(), nn.Linear(256, input_dim))
-        self.classifier = nn.Sequential(nn.Linear(latent_dim, 32), nn.ReLU(), nn.Dropout(0.2), nn.Linear(32, 1), nn.Sigmoid())
 
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def forward(self, x, mode='train'):
-        h = self.encoder_base(x)
-        mu, logvar = self.fc_mu(h), self.fc_logvar(h)
-        z = self.reparameterize(mu, logvar)
-        if mode == 'pretrain':
-            return self.decoder(z), mu, logvar
-        else:
-            return self.classifier(mu).squeeze() # Use mu for stable inference
-
-class QSMDecoder(nn.Module):
-    def __init__(self, feat_dim=512):
-        super().__init__()
-        # Input is (B, 512, 1, 1)
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(feat_dim, 256, 4, 1, 0), nn.ReLU(),
-            nn.ConvTranspose2d(256, 128, 4, 2, 1), nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, 4, 2, 1), nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, 4, 2, 1), nn.ReLU(),
-            nn.ConvTranspose2d(32, 1, 4, 2, 1), nn.Sigmoid()
-        )
-    def forward(self, x): return self.decoder(x)

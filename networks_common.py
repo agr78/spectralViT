@@ -222,69 +222,111 @@ class FocalLoss(nn.Module):
 
 class PassThrough(nn.Module):
     def forward(self, x, **kwargs): return x
-
-
-
-
-class AttentionUNet(nn.Module):
-    """
-    Identical refactor of CompactAttnUNet.
-    3-layer encoder using strided convolutions and latent self-attention.
-    """
-    def __init__(self, in_channels=1, base_channels=7):
-        super().__init__()
-        # Encoder matching CompactAttnUNet logic
-        self.conv1 = nn.Conv3d(in_channels, base_channels, kernel_size=3, padding=1, stride=2) 
-        self.conv2 = nn.Conv3d(base_channels, base_channels*2, kernel_size=3, padding=1, stride=2) 
-        self.conv3 = nn.Conv3d(base_channels*2, base_channels*4, kernel_size=3, padding=1, stride=2) 
-        
-        # AttentionBlock
-        self.attn = AttentionBlock(
-            F_g=base_channels*4, 
-            F_l=base_channels*4, 
-            F_int=base_channels*2
-        )
-        
-        self.pool = nn.AdaptiveAvgPool3d(1)
-        self.classifier = nn.Linear(base_channels*4, 1)
-
-    def forward(self, x):
-        x1 = F.relu(self.conv1(x))
-        x2 = F.relu(self.conv2(x1))
-        x3 = F.relu(self.conv3(x2))
-        
-        # Self-attention on the bottleneck/latent space
-        g = self.attn(g=x3, x=x3)
-        
-        out = self.pool(g).view(g.size(0), -1)
-        return self.classifier(out).squeeze(-1)
-
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 class AttentionBlock(nn.Module):
-    def __init__(self, F_g, F_l, F_int):
-        super().__init__()
-        self.W_g = nn.Sequential(
-            nn.Conv3d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm3d(F_int)
-        )
-        self.W_x = nn.Sequential(
-            nn.Conv3d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm3d(F_int)
-        )
-        self.psi = nn.Sequential(
-            nn.Conv3d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm3d(1),
-            nn.Sigmoid()
-        )
-        self.relu = nn.ReLU(inplace=True)
+    def __init__(self, F_g=None, F_l=None, F_int=None, is_spatial_2d=False):
+        super(AttentionBlock, self).__init__()
+        self.is_spatial_2d = is_spatial_2d
+        
+        if not is_spatial_2d:
+            # ORIGINAL 3D GATE
+            self.W_g = nn.Sequential(
+                nn.Conv3d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+                nn.BatchNorm3d(F_int)
+            )
+            self.W_x = nn.Sequential(
+                nn.Conv3d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+                nn.BatchNorm3d(F_int)
+            )
+            self.psi = nn.Sequential(
+                nn.Conv3d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+                nn.BatchNorm3d(1),
+                nn.Sigmoid()
+            )
+            self.relu = nn.ReLU(inplace=True)
+        else:
+            # EXACT FASTUNET SPATIAL ATTENTION
+            self.conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+            self.sigmoid = nn.Sigmoid()
 
-    def forward(self, g, x):
-        g1 = self.W_g(g)
-        x1 = self.W_x(x)
-        psi = self.relu(g1 + x1)
-        psi = self.psi(psi)
-        return x * psi
+    def forward(self, g, x=None):
+        if self.is_spatial_2d:
+            # Logic: x * (1 + att)
+            avg_out = torch.mean(g, dim=1, keepdim=True)
+            max_out, _ = torch.max(g, dim=1, keepdim=True)
+            att = torch.cat([avg_out, max_out], dim=1)
+            att = self.sigmoid(self.conv(att))
+            return g * (1 + att)
+        else:
+            # Logic: x * psi
+            g1 = self.W_g(g)
+            x1 = self.W_x(x)
+            psi = self.relu(g1 + x1)
+            psi = self.psi(psi)
+            return x * psi
 
+class AttentionUNet(nn.Module):
+    def __init__(self, in_channels=1, base_channels=7, fast_mode=False, use_sigmoid=False):
+        super(AttentionUNet, self).__init__()
+        self.fast_mode = fast_mode
+        self.use_sigmoid = use_sigmoid
+
+        if not fast_mode:
+            # --- ORIGINAL 3D MODEL ---
+            self.conv1 = nn.Conv3d(in_channels, base_channels, kernel_size=3, padding=1, stride=2) 
+            self.conv2 = nn.Conv3d(base_channels, base_channels*2, kernel_size=3, padding=1, stride=2) 
+            self.conv3 = nn.Conv3d(base_channels*2, base_channels*4, kernel_size=3, padding=1, stride=2) 
+            self.attn = AttentionBlock(base_channels*4, base_channels*4, base_channels*2, is_spatial_2d=False)
+            self.pool = nn.AdaptiveAvgPool3d(1)
+            self.classifier = nn.Linear(base_channels*4, 1)
+        else:
+            # --- EXACT FASTUNET REPLICA ---
+            def conv_block(in_c, out_c):
+                return nn.Sequential(
+                    nn.Conv2d(in_c, out_c, 3, padding=1, bias=False),
+                    nn.BatchNorm2d(out_c),
+                    nn.ReLU(inplace=True)
+                )
+            self.enc1 = conv_block(in_channels, base_channels)    # 16
+            self.enc2 = conv_block(base_channels, base_channels*2) # 32
+            self.pool2d = nn.MaxPool2d(2)
+            self.bottleneck = conv_block(base_channels*2, base_channels*4) # 64
+            
+            self.attn = AttentionBlock(is_spatial_2d=True)
+            self.gmp = nn.AdaptiveMaxPool2d(1)
+            self.fc = nn.Sequential(
+                nn.Linear(base_channels*4, base_channels*2), # 64 -> 32
+                nn.ReLU(inplace=True),
+                nn.Linear(base_channels*2, 1)                # 32 -> 1
+            )
+            nn.init.zeros_(self.fc[-1].weight)
+            nn.init.zeros_(self.fc[-1].bias)
+
+    def forward(self, x, return_logit=False):
+        if self.fast_mode:
+            # Replicating the 2-pool logic of FastUNet
+            if x.dim() == 5: x = x.mean(dim=2)
+            x1 = self.enc1(x)
+            x2 = self.enc2(self.pool2d(x1))
+            bn = self.bottleneck(self.pool2d(x2))
+            bn = self.attn(bn)
+            pooled = self.gmp(bn).view(x.size(0), -1)
+            logit = self.fc(pooled).squeeze(-1)
+        else:
+            x1 = F.relu(self.conv1(x))
+            x2 = F.relu(self.conv2(x1))
+            x3 = F.relu(self.conv3(x2))
+            g = self.attn(g=x3, x=x3)
+            out = self.pool(g).view(g.size(0), -1)
+            logit = self.classifier(out).squeeze(-1)
+
+        if logit.ndim == 0: logit = logit.unsqueeze(0)
+        if self.use_sigmoid and not return_logit:
+            return torch.sigmoid(logit)
+        return logit
 
 # Shifted window (Swin) transformer
 class SwinBlock(nn.Module):
