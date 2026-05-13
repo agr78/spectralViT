@@ -17,7 +17,7 @@ Candidate selection can be found in [`dbs.ipynb`](https://github.com/agr78/Spect
 
 ## Publications
 If this code is used, please cite the following:
-> [Preprint]([https://doi.org/10.1227/neu.0000000000003721](https://openreview.net/attachment?id=cH5gmxBepK&name=pdf)): A. G. Roberts et al., "Spectral Vision Transformer for Efficient Tokenization with Limited Data", 2026
+> [Preprint](http://arxiv.org/abs/2605.12026): A. G. Roberts et al., ‘Spectral Vision Transformer for Efficient Tokenization with Limited Data’, arXiv [cs.CV]. 2026.
 > 
 
 ## BibTex
