@@ -42,7 +42,9 @@ If this code is used, please cite the following:
       eprint={2605.12026},
       archivePrefix={arXiv},
       primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2605.12026}, 
+      url={https://arxiv.org/abs/2605.12026},
+      doi={10.48550/arXiv.2605.12026}
+
 }
 ```
 
