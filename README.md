@@ -25,7 +25,19 @@ If this code is used, please cite the following:
 ```bibtex
 @misc{Roberts2026spectralViT},
       title={Spectral Vision Transformer for Efficient Tokenization with Limited Data}, 
-      author={Alexandra G. Roberts and Maneesh John and Jinwei Zhang and Dominick Romano and Mert Sisman and Ki Sueng Choi and Heejong Kim and Mert R. Sabuncu and Thanh D. Nguyen and Alexey V. Dimov and Pascal Spincemaille and Brian H. Kopell and Yi Wang},
+      author={Alexandra G. Roberts and 
+            Maneesh John and
+            Jinwei Zhang and 
+            Dominick Romano and 
+            Mert Sisman and 
+            Ki Sueng Choi and 
+            Heejong Kim and 
+            Mert R. Sabuncu and 
+            Thanh D. Nguyen and 
+            Alexey V. Dimov and 
+            Pascal Spincemaille and 
+            Brian H. Kopell and 
+            Yi Wang},
       year={2026},
       eprint={2605.12026},
       archivePrefix={arXiv},
