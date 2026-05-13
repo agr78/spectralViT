@@ -1,6 +1,6 @@
 # Spectral Vision Transformer
 
-Repository for [_Spectral Vision Transformer for Efficient Tokenization with Limited Data_](https://openreview.net/pdf?id=cH5gmxBepK).
+Repository for [_Spectral Vision Transformer for Efficient Tokenization with Limited Data_](https://arxiv.org/abs/2605.12026).
 
 ![Schematic of the spectral ViT with parameterized linear projection $\mathbf{E}$. This embedding results in spectral tokens $\mathbf{s}$ with inherent rank or
 hierarchical order. Our approach introduces a global inductive bias and spectral positional embeddings $\mathbf{e}_{pos}$ by mode rather than local patch embedding](figs/spectralViT_dm.png)
