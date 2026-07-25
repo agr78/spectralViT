@@ -6,6 +6,21 @@ import nibabel as nib
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.ndimage import affine_transform, gaussian_filter
+from util import robust_flatten
+import pandas as pd
+import re
+
+def get_slice_level_data(dataset, target_dim, include_unlabeled=False):
+    all_imgs, all_clins, all_lbls, subj_map = [], [], [], []
+    for i in range(len(dataset)):
+        img, clin, lbl, _ = dataset[i]
+        if (i % 72) in [0]: continue  # Skip specific slices if necessary
+        if (lbl != -1) or (include_unlabeled and lbl == -1):
+            all_imgs.append(robust_flatten(img.numpy().squeeze(), target_dim))
+            all_clins.append(clin.numpy())
+            all_lbls.append(lbl)
+            subj_map.append(i)
+    return np.array(all_imgs), np.array(all_clins), np.array(all_lbls), np.array(subj_map)
 
 def fast_resample_sharp(volume, msw_res=0.5, chh_res=0.9, target_shape=(64, 64, 72), sharpen=True):
     m_res, c_res = float(msw_res), float(chh_res)
@@ -374,3 +389,113 @@ class QSM_c1_Dataset(Dataset):
         
         # ALWAYS return 4 values to satisfy the (imgs, clin, _, _) loop
         return img_tensor, clin_vec, label, index
+
+def load_ixi_data(mni_dir, csv_path, vol_size=96):
+    """
+    Load IXI dataset for sex classification.
+    
+    Args:
+        mni_dir: Directory containing MNI-registered NIfTI files
+        csv_path: Path to CSV with subject metadata
+        vol_size: Size of cropped volume (cubic)
+        
+    Returns:
+        X: Array of volumes (N, vol_size, vol_size, vol_size)
+        Y: Array of labels (N,) - 0 for male, 1 for female
+    """
+    df = pd.read_csv(csv_path)
+    id_col = [c for c in df.columns if 'ID' in c.upper()][0]
+    sex_col = [c for c in df.columns if 'SEX' in c.upper()][0]
+    sex_lookup = dict(zip(df[id_col].astype(int), df[sex_col].map({1: 0, 2: 1})))
+    
+    files = sorted([f for f in os.listdir(mni_dir) if f.endswith('.nii.gz')])
+    vols, labels = [], []
+    
+    for f in tqdm(files, desc="Loading Data"):
+        match = re.search(r'(\d+)', f)
+        if match and int(match.group(1)) in sex_lookup:
+            img = nib.load(os.path.join(mni_dir, f)).get_fdata()
+            c = np.array(img.shape) // 2
+            r = vol_size // 2
+            crop = img[c[0]-r:c[0]+r, c[1]-r:c[1]+r, c[2]-r:c[2]+r]
+            if crop.shape == (vol_size, vol_size, vol_size):
+                crop = (crop - np.mean(crop)) / (np.std(crop) + 1e-8)
+                vols.append(crop.astype(np.float32))
+                labels.append(sex_lookup[int(match.group(1))])
+    
+    return np.array(vols), np.array(labels).astype(np.float32)
+
+
+def generate_distance_data(n_samples, vol_size=32, swapped=False, seed=None):
+    """
+    Generate synthetic data for distance classification task.
+    Two dots in 3D space - classify based on their distance.
+    
+    Args:
+        n_samples: Number of samples to generate
+        vol_size: Size of 3D volume
+        swapped: If True, swap left/right position (for distribution shift)
+        seed: Random seed
+        
+    Returns:
+        X: Tensor of shape (n_samples, 1, vol_size, vol_size, vol_size)
+        Y: Tensor of labels (n_samples,)
+    """
+    if seed is not None:
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+    
+    X = torch.zeros(n_samples, 1, vol_size, vol_size, vol_size)
+    Y = torch.zeros(n_samples, dtype=torch.long)
+    
+    for i in range(n_samples):
+        # Randomly choose class
+        label = np.random.randint(0, 2)
+        
+        # Set distance based on class
+        if label == 0:  # Close
+            distance = np.random.uniform(3, 8)
+        else:  # Far
+            distance = np.random.uniform(12, 18)
+        
+        # Random center point
+        center = np.random.uniform(vol_size * 0.3, vol_size * 0.7, 3)
+        
+        # Random direction
+        direction = np.random.randn(3)
+        direction = direction / np.linalg.norm(direction)
+        
+        # Calculate two points
+        point1 = center - direction * distance / 2
+        point2 = center + direction * distance / 2
+        
+        # Swap positions if requested (for distribution shift)
+        if swapped:
+            if point1[0] < vol_size / 2:  # If left
+                point1[0] = vol_size - point1[0]  # Move to right
+            if point2[0] < vol_size / 2:
+                point2[0] = vol_size - point2[0]
+        
+        # Clip to volume bounds
+        point1 = np.clip(point1, 0, vol_size - 1).astype(int)
+        point2 = np.clip(point2, 0, vol_size - 1).astype(int)
+        
+        # Place dots
+        X[i, 0, point1[0], point1[1], point1[2]] = 1
+        X[i, 0, point2[0], point2[1], point2[2]] = 1
+        Y[i] = label
+    
+    return X, Y
+
+class BalancedDataset(Dataset):
+    def __init__(self, X, Y):
+        self.X, self.Y = X, Y
+        self.pos_idx = np.where(Y == 1)[0]
+        self.neg_idx = np.where(Y == 0)[0]
+        self.count = max(len(self.pos_idx), len(self.neg_idx)) * 2
+
+    def __len__(self): return self.count
+
+    def __getitem__(self, idx):
+        i = np.random.choice(self.pos_idx) if idx % 2 == 0 else np.random.choice(self.neg_idx)
+        return self.X[i], self.Y[i]

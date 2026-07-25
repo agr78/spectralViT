@@ -5,6 +5,8 @@ import gzip
 import numpy as np
 import pandas as pd
 import nibabel as nib
+from loader import QSM_Dataset
+from loader import fast_resample_sharp
 
 def prepare_qsm_dataset(source_type, nii_path, seg_path, csv_path, cache_path, 
                         load_cache=False, limit=None, mask_crop_fn=None,
@@ -42,7 +44,6 @@ def prepare_qsm_dataset(source_type, nii_path, seg_path, csv_path, cache_path,
     resample_fn = None
     
     if source_type.upper() == 'CHH':
-        from util import fast_resample_sharp 
         resample_fn = fast_resample_sharp 
         final_nii_dir, final_seg_dir = tempfile.mkdtemp(), tempfile.mkdtemp()
         
@@ -201,7 +202,6 @@ def prepare_qsm_dataset(source_type, nii_path, seg_path, csv_path, cache_path,
         return None
 
     # 5. DATASET INIT (Caching starts here)
-    from util import QSM_Dataset 
     dataset = QSM_Dataset(final_nii_dir, final_seg_dir, mask_crop_fn, clinical_dict, label_map, 
                           limit=limit, cache_path=cache_path, load_cache=load_cache, 
                           return_index=True, ext_mask_dir=ext_mask_dir, resample_fn=resample_fn)

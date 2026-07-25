@@ -31,14 +31,55 @@ def mean_std_str(values):
     values = np.asarray(values)
     return f"{np.mean(values):.3f} ± {np.std(values):.3f}"
 
+def delong_roc_variance(ground_truth, predictions):
+    """
+    Computes the structural components (V10 and V01) for DeLong's variance.
+    """
+    m = sum(ground_truth == 1)
+    n = sum(ground_truth == 0)
+    
+    # Get scores of positives and negatives
+    pos = predictions[ground_truth == 1]
+    neg = predictions[ground_truth == 0]
+    
+    # Compute structural components (V10 and V01)
+    # v10[i] captures how often negative samples score lower than the i-th positive sample
+    v10 = np.array([np.sum(neg < p) + 0.5 * np.sum(neg == p) for p in pos]) / n
+    # v01[j] captures how often positive samples score higher than the j-th negative sample
+    v01 = np.array([np.sum(pos > p) + 0.5 * np.sum(pos == p) for p in neg]) / m
+    
+    return v10, v01
+
 def compare_auc_significance(y_true, prob_base, prob_model):
-    """Asymptotic comparison of AUCs (DeLong-like approximation)."""
+    """
+    Exact implementation of the DeLong test for two correlated ROC curves.
+    """
+    y_true = np.array(y_true)
+    prob_base = np.array(prob_base)
+    prob_model = np.array(prob_model)
+    
     auc_base = roc_auc_score(y_true, prob_base)
     auc_model = roc_auc_score(y_true, prob_model)
-    n1, n0 = sum(y_true == 1), sum(y_true == 0)
-    var_diff = ((auc_base * (1 - auc_base) + (n1 - 1) * (0.1 - auc_base**2) + (n0 - 1) * (0.1 - auc_base**2)) / (n1 * n0))
+    
+    # Get structural components
+    v10_base, v01_base = delong_roc_variance(y_true, prob_base)
+    v10_model, v01_model = delong_roc_variance(y_true, prob_model)
+    
+    # Covariance matrices of the structural components
+    S10 = np.cov(v10_base, v10_model)
+    S01 = np.cov(v01_base, v01_model)
+    
+    m = sum(y_true == 1)
+    n = sum(y_true == 0)
+    
+    # DeLong variance of the difference (accounting for covariance)
+    var_diff = (S10[0, 0] + S10[1, 1] - 2 * S10[0, 1]) / m + \
+               (S01[0, 0] + S01[1, 1] - 2 * S01[0, 1]) / n
+               
+    # Z-score and two-sided p-value
     z = (auc_model - auc_base) / np.sqrt(max(var_diff, 1e-8))
-    p_value = 1 - stats.norm.cdf(z)
+    p_value = 2 * (1 - stats.norm.cdf(abs(z)))
+    
     return auc_model - auc_base, p_value
 
 def mask_crop(data, mask, pad, viz=False):
