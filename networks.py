@@ -623,3 +623,69 @@ def laplacian_tokenize(img_size, img_clean, img_noisy, k, threshold=0.03, topo_l
     return tokens, img_recon
 
 
+class LogisticRegression(nn.Module):
+    def __init__(self, in_features):
+        super().__init__(); self.linear = nn.Linear(in_features, 1)
+    def forward(self, x): return self.linear(x)
+
+
+class MultiLayerPerceptron(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int):
+        """
+        A simple 2-layer Multi-Layer Perceptron (MLP).
+        
+        Args:
+            input_dim (int): The number of input features (formerly N_COMP).
+            hidden_dim (int): The number of hidden units (formerly MLP_HIDDEN_DIM).
+        """
+        super(MultiLayerPerceptron, self).__init__()
+        
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Defines the forward pass of the MLP.
+        """
+        return self.network(x)
+    
+class MultiClassSpectralViT(nn.Module):
+    def __init__(self, n_inputs, chunk_size=4, num_classes=10, embed_dim=128, n_heads=4, n_layers=2):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.n_tokens = n_inputs // chunk_size
+        self.proj = nn.Linear(chunk_size, embed_dim)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.n_tokens, embed_dim))
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=n_heads)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.classifier = nn.Linear(embed_dim, num_classes)
+
+    def forward(self, x):
+        b = x.shape[0]
+        x = x.view(b, self.n_tokens, self.chunk_size)
+        x = self.proj(x) + self.pos_embed
+        x = x.permute(1, 0, 2) # (Seq, Batch, Dim) for legacy
+        x = self.transformer(x)
+        return self.classifier(x.mean(dim=0))
+
+class MultiClassSpatialViT(nn.Module):
+    def __init__(self, num_classes=10, size=28, patch_size=4, in_channels=1, embed_dim=128, n_heads=4, n_layers=2):
+        super().__init__()
+        self.patch_size = patch_size
+        self.n_patches = (size // patch_size) ** 2
+        self.proj = nn.Linear(patch_size * patch_size * in_channels, embed_dim)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.n_patches, embed_dim))
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=n_heads)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.classifier = nn.Linear(embed_dim, num_classes)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        p = self.patch_size
+        x = x.unfold(2, p, p).unfold(3, p, p).contiguous().view(b, self.n_patches, -1) 
+        x = self.proj(x) + self.pos_embed
+        x = x.permute(1, 0, 2) 
+        x = self.transformer(x)
+        return self.classifier(x.mean(dim=0))

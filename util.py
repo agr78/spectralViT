@@ -4,7 +4,7 @@ import os
 import matplotlib.pyplot as plt
 import random
 from scipy.interpolate import PchipInterpolator
-from sklearn.metrics import recall_score, roc_auc_score, confusion_matrix, f1_score
+from sklearn.metrics import recall_score, roc_auc_score, confusion_matrix, f1_score, accuracy_score, top_k_accuracy_score, roc_auc_score
 import scipy.stats as stats
 import numpy as np
 from networks import pca_tokenize, fourier_tokenize, laplacian_tokenize
@@ -191,6 +191,17 @@ def get_metrics_array(y_true, y_probs):
     auc = roc_auc_score(y_true, y_probs)
     return np.array([acc, sens, spec, auc])
 
+def get_cv_fold_metrics(name,cv_probs,all_cv_labels,thresholds):
+    probs = np.array(cv_probs[name])
+    labels = np.array(all_cv_labels)
+    fold_indices = np.array_split(np.arange(len(labels)), 5)
+
+    fold_results = []
+    for idxs in fold_indices:
+        m = compute_comprehensive_metrics(labels[idxs], probs[idxs], thresholds[name])
+        fold_results.append(m)
+    return fold_results
+
 def generate_distance_data(n_samples, VOL_SIZE, swapped=False):
     X = torch.zeros((n_samples, 1, VOL_SIZE, VOL_SIZE, VOL_SIZE))
     Y = torch.randint(0, 2, (n_samples,)).float()
@@ -299,3 +310,94 @@ def plot_sl_recon(scenarios, noise_lvl, X_train_pca, K, img_size):
 
     plt.suptitle(f'Spectral tokenization by basis', fontsize=20, y=0.95)
     plt.show()
+
+import numpy as np
+import scipy.stats as stats
+from sklearn.metrics import roc_auc_score
+
+
+def delong_roc_variance(y_true, predictions):
+    """Computes the structural components (V10 and V01) underlying DeLong's
+    variance estimator for the AUC of a single set of predictions."""
+    y_true = np.asarray(y_true)
+    predictions = np.asarray(predictions)
+    m = np.sum(y_true == 1)
+    n = np.sum(y_true == 0)
+
+    pos = predictions[y_true == 1]
+    neg = predictions[y_true == 0]
+
+    v10 = np.array([np.sum(neg < p) + 0.5 * np.sum(neg == p) for p in pos]) / n
+    v01 = np.array([np.sum(pos > p) + 0.5 * np.sum(pos == p) for p in neg]) / m
+    return v10, v01
+
+
+def compute_delong_paired(y_true, preds_baseline, preds_model):
+    """Paired DeLong test for ROC AUC comparison, using rank-based structural
+    components and their covariance across two correlated ROC curves. Uses
+    the survival function to retain precision for extreme p-values."""
+    y_true = np.asarray(y_true)
+    auc_base = roc_auc_score(y_true, preds_baseline)
+    auc_mod = roc_auc_score(y_true, preds_model)
+
+    v10_base, v01_base = delong_roc_variance(y_true, preds_baseline)
+    v10_mod, v01_mod = delong_roc_variance(y_true, preds_model)
+
+    m = np.sum(y_true == 1)
+    n = np.sum(y_true == 0)
+
+    S10 = np.cov(v10_base, v10_mod)
+    S01 = np.cov(v01_base, v01_mod)
+
+    var_diff = (S10[0, 0] + S10[1, 1] - 2 * S10[0, 1]) / m + \
+               (S01[0, 0] + S01[1, 1] - 2 * S01[0, 1]) / n
+
+    diff = auc_base - auc_mod
+    z = diff / np.sqrt(max(var_diff, 1e-12))
+    p_val = 2 * stats.norm.sf(abs(z))
+    return z, p_val
+
+
+def compute_mcnemar(y_true, preds_base_bin, preds_mod_bin):
+    """McNemar's test with continuity correction, using the survival
+    function to retain precision for extreme p-values."""
+    y_true = np.asarray(y_true)
+    b = np.sum((preds_base_bin == y_true) & (preds_mod_bin != y_true))
+    c = np.sum((preds_base_bin != y_true) & (preds_mod_bin == y_true))
+    if (b + c) == 0:
+        return 0.0, 1.0
+    chi2 = (abs(b - c) - 1) ** 2 / (b + c)
+    p_val = stats.chi2.sf(chi2, df=1)
+    return chi2, p_val
+
+def fmt_cv(key, cells):
+    mean_val, std_val = cells[key]
+    return f"{mean_val:.3f}±{std_val:.3f}"
+
+def get_stratified_subset(dataset, per_class):
+    indices = []
+    labels = dataset.targets.numpy()
+    for i in range(10):
+        idx = np.where(labels == i)[0]
+        selected = np.random.choice(idx, per_class, replace=False)
+        indices.extend(selected)
+    imgs = torch.stack([dataset[i][0] for i in indices])
+    targets = torch.tensor([dataset[i][1] for i in indices])
+    return imgs, targets
+
+def smooth_curve(x, y, n):
+    x, y = np.array(x), np.array(y)
+    if len(x) <= 2: return x, y
+    x_log = np.log10(x)
+    x_new_log = np.linspace(x_log.min(), x_log.max(), n)
+    interp = PchipInterpolator(x_log, y)
+    y_smooth = interp(x_new_log)
+    return 10**x_new_log, np.clip(y_smooth, 0, 1.0)
+
+def compute_multiclass_metrics(probs, y_true):
+    return {
+        'T1': accuracy_score(y_true, np.argmax(probs, axis=1)),
+        'T3': top_k_accuracy_score(y_true, probs, k=3, labels=np.arange(10)),
+        'T5': top_k_accuracy_score(y_true, probs, k=5, labels=np.arange(10)),
+        'AUC': roc_auc_score(y_true, probs, multi_class='ovr', labels=np.arange(10))
+    }
