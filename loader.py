@@ -6,6 +6,23 @@ import nibabel as nib
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.ndimage import affine_transform, gaussian_filter
+from util import robust_flatten
+import pandas as pd
+import re
+import glob
+import io
+
+def get_slice_level_data(dataset, target_dim, include_unlabeled=False):
+    all_imgs, all_clins, all_lbls, subj_map = [], [], [], []
+    for i in range(len(dataset)):
+        img, clin, lbl, _ = dataset[i]
+        if (i % 72) in [0]: continue  # Skip specific slices if necessary
+        if (lbl != -1) or (include_unlabeled and lbl == -1):
+            all_imgs.append(robust_flatten(img.numpy().squeeze(), target_dim))
+            all_clins.append(clin.numpy())
+            all_lbls.append(lbl)
+            subj_map.append(i)
+    return np.array(all_imgs), np.array(all_clins), np.array(all_lbls), np.array(subj_map)
 
 def fast_resample_sharp(volume, msw_res=0.5, chh_res=0.9, target_shape=(64, 64, 72), sharpen=True):
     m_res, c_res = float(msw_res), float(chh_res)
@@ -374,3 +391,339 @@ class QSM_c1_Dataset(Dataset):
         
         # ALWAYS return 4 values to satisfy the (imgs, clin, _, _) loop
         return img_tensor, clin_vec, label, index
+
+def load_ixi_data(mni_dir, csv_path, vol_size=96):
+    """
+    Load IXI dataset for sex classification.
+    
+    Args:
+        mni_dir: Directory containing MNI-registered NIfTI files
+        csv_path: Path to CSV with subject metadata
+        vol_size: Size of cropped volume (cubic)
+        
+    Returns:
+        X: Array of volumes (N, vol_size, vol_size, vol_size)
+        Y: Array of labels (N,) - 0 for male, 1 for female
+    """
+    df = pd.read_csv(csv_path)
+    id_col = [c for c in df.columns if 'ID' in c.upper()][0]
+    sex_col = [c for c in df.columns if 'SEX' in c.upper()][0]
+    sex_lookup = dict(zip(df[id_col].astype(int), df[sex_col].map({1: 0, 2: 1})))
+    
+    files = sorted([f for f in os.listdir(mni_dir) if f.endswith('.nii.gz')])
+    vols, labels = [], []
+    
+    for f in tqdm(files, desc="Loading Data"):
+        match = re.search(r'(\d+)', f)
+        if match and int(match.group(1)) in sex_lookup:
+            img = nib.load(os.path.join(mni_dir, f)).get_fdata()
+            c = np.array(img.shape) // 2
+            r = vol_size // 2
+            crop = img[c[0]-r:c[0]+r, c[1]-r:c[1]+r, c[2]-r:c[2]+r]
+            if crop.shape == (vol_size, vol_size, vol_size):
+                crop = (crop - np.mean(crop)) / (np.std(crop) + 1e-8)
+                vols.append(crop.astype(np.float32))
+                labels.append(sex_lookup[int(match.group(1))])
+    
+    return np.array(vols), np.array(labels).astype(np.float32)
+
+
+def _parse_age_value(val, age_in_months=False):
+    """
+    Parse a single age entry that may be:
+      - a plain number (e.g. 34, 34.0, 408 if in months)
+      - a 5-year bracket string as used by HCP-YA's unrestricted release ('22-25')
+      - an open-ended bracket ('36+')
+    Returns a float age in years, or np.nan if it can't be parsed.
+    """
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return np.nan
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        v = float(val)
+    else:
+        s = str(val).strip()
+        m = re.match(r'^(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)$', s)
+        if m:
+            v = (float(m.group(1)) + float(m.group(2))) / 2.0
+        else:
+            m = re.match(r'^(\d+(?:\.\d+)?)\s*\+$', s)
+            if m:
+                # Open-ended bracket (e.g. "36+"): assume the same ~5-yr width as
+                # the rest of the HCP-YA scale so it stays roughly comparable.
+                v = float(m.group(1)) + 2.5
+            else:
+                m = re.match(r'^(\d+(?:\.\d+)?)', s)
+                v = float(m.group(1)) if m else np.nan
+    if np.isnan(v):
+        return v
+    return v / 12.0 if age_in_months else v
+
+
+def load_hcp_data(data_dir, csv_path, vol_size=96,
+                   file_glob='*T1w*restore*brain*.nii.gz',
+                   id_col=None, age_col=None, age_in_months=False,
+                   verbose=True):
+    """
+    Load HCP (Human Connectome Project) structural T1w volumes for AGE PREDICTION
+    (continuous regression), the HCP counterpart of load_ixi_data's sex classification.
+
+    Unlike IXI's flat directory of files, HCP releases nest each subject's scan a
+    few levels deep and use different naming conventions per release, e.g.:
+      - HCP-YA (MNINonLinear):  <data_dir>/<subject>/MNINonLinear/T1w_restore_brain.nii.gz
+      - HCP-YA (native/ACPC):   <data_dir>/<subject>/T1w/T1w_acpc_dc_restore_brain.nii.gz
+      - HCP-Aging/Development (BIDS-derivatives): <data_dir>/sub-*/anat/*_desc-preproc_T1w.nii.gz
+    so this loader searches `data_dir` recursively for `file_glob` and matches each
+    file back to a subject by looking for the CSV's subject ID as a path token,
+    rather than assuming a fixed folder depth like the IXI loader does.
+
+    Age handling also differs from IXI's binary sex label: HCP-YA's unrestricted
+    CSV only ships 5-year brackets ("22-25", "26-30", "31-35", "36+"), while
+    HCP-Aging/Development and the restricted HCP-YA CSV give an exact age (in
+    years, or months under a NDA-style "interview_age" column). This function
+    auto-detects which of those it's given and converts everything to a single
+    continuous "age in years" float so the rest of the pipeline (PCA, ViT/U-Net
+    regression heads, MSE/MAE losses) doesn't need to know the difference.
+    Brackets are a real limitation, though: they cap the achievable MAE at roughly
+    half the bracket width, so prefer an exact-age column/CSV when you have one.
+
+    Args:
+        data_dir: Root directory to search recursively for T1w NIfTI volumes.
+        csv_path: Path to CSV with a subject-ID column and an age column.
+        vol_size: Size of the cropped cubic volume (must match the model's
+            expected input, e.g. 96 to match SpectralViT/SpatialViT defaults).
+        file_glob: Recursive glob (relative to data_dir) used to find volumes.
+            Adjust to match your preprocessing pipeline, e.g.:
+              'T1w_restore_brain.nii.gz'            (HCP-YA, MNINonLinear space)
+              'T1w_acpc_dc_restore_brain.nii.gz'    (HCP-YA, native/ACPC space)
+              '*_desc-preproc_T1w.nii.gz'           (HCP-Aging/Development, BIDS)
+        id_col: Subject-ID column name in the CSV. Auto-detected if None.
+        age_col: Age column name in the CSV. Auto-detected if None.
+        age_in_months: Set True if age_col is in months (e.g. NDA "interview_age").
+            Auto-set True if a column literally named "interview_age" is selected.
+        verbose: Print auto-detected columns and loading progress.
+
+    Returns:
+        X: Array of volumes (N, vol_size, vol_size, vol_size), per-volume z-scored.
+        Y: Array of ages in years (N,), dtype float32.
+        subject_ids: List of the N subject ID strings, in the same order as X/Y.
+    """
+    df = pd.read_csv(csv_path)
+
+    if id_col is None:
+        # NDA exports carry two subject identifiers: 'subjectkey' (the global,
+        # cross-study de-identified GUID) and 'src_subject_id' (the site-specific
+        # ID, e.g. "HCA6002236"). Imaging package directories are named after the
+        # latter, so it must win if both are present.
+        cols_upper = {c.upper(): c for c in df.columns}
+        if 'SRC_SUBJECT_ID' in cols_upper:
+            id_col = cols_upper['SRC_SUBJECT_ID']
+        else:
+            id_candidates = [c for c in df.columns if 'SUBJ' in c.upper() or c.upper() == 'ID']
+            if not id_candidates:
+                id_candidates = [c for c in df.columns if 'ID' in c.upper()]
+            if not id_candidates:
+                raise ValueError("Could not auto-detect a subject-ID column; pass id_col explicitly.")
+            id_col = id_candidates[0]
+
+    if age_col is None:
+        age_candidates = [c for c in df.columns if 'AGE' in c.upper()]
+        if not age_candidates:
+            raise ValueError("Could not auto-detect an age column; pass age_col explicitly.")
+        yrs = [c for c in age_candidates if 'YR' in c.upper() or 'YEAR' in c.upper()]
+        interview = [c for c in age_candidates if 'INTERVIEW' in c.upper()]
+        if yrs:
+            age_col = yrs[0]
+        elif interview:
+            age_col = interview[0]
+            age_in_months = True
+        else:
+            age_col = age_candidates[0]
+
+    if verbose:
+        unit = " (months)" if age_in_months else ""
+        print(f"Using ID column: '{id_col}', age column: '{age_col}'{unit}")
+
+    age_lookup = {
+        str(sid).strip(): _parse_age_value(age, age_in_months)
+        for sid, age in zip(df[id_col], df[age_col])
+    }
+    age_lookup = {k: v for k, v in age_lookup.items() if not np.isnan(v)}
+    id_lookup_upper = {k.upper(): k for k in age_lookup}
+
+    files = sorted(glob.glob(os.path.join(data_dir, '**', file_glob), recursive=True))
+    if verbose:
+        print(f"Found {len(files)} candidate volumes under {data_dir}")
+
+    vols, labels, subj_ids = [], [], []
+    for fpath in tqdm(files, desc="Loading HCP Data"):
+        rel = os.path.relpath(fpath, data_dir)
+        tokens = re.split(r'[\\/_.\-]', rel)
+
+        matched_id = None
+        for tok in tokens:
+            if tok.upper() in id_lookup_upper:
+                matched_id = id_lookup_upper[tok.upper()]
+                break
+        if matched_id is None:
+            # Fallback for flat/numeric layouts (e.g. IXI-style): a bare run of digits.
+            digit_match = re.search(r'(\d{5,})', rel)
+            if digit_match and digit_match.group(1) in age_lookup:
+                matched_id = digit_match.group(1)
+        if matched_id is None:
+            continue
+
+        try:
+            img = nib.load(fpath).get_fdata()
+        except Exception as e:
+            if verbose:
+                print(f"Skipping {fpath}: {e}")
+            continue
+
+        c = np.array(img.shape[:3]) // 2
+        r = vol_size // 2
+        crop = img[c[0]-r:c[0]+r, c[1]-r:c[1]+r, c[2]-r:c[2]+r]
+        if crop.shape != (vol_size, vol_size, vol_size):
+            continue
+
+        crop = (crop - np.mean(crop)) / (np.std(crop) + 1e-8)
+        vols.append(crop.astype(np.float32))
+        labels.append(age_lookup[matched_id])
+        subj_ids.append(matched_id)
+
+    if verbose:
+        print(f"Loaded {len(vols)} / {len(files)} volumes with matched ages")
+
+    return np.array(vols), np.array(labels).astype(np.float32), subj_ids
+
+
+def prepare_nda_csv(txt_path, out_csv_path=None, sep='\t'):
+    """
+    Convert an NDA "data structure" export (the .txt file bundled in a downloadcmd
+    package, e.g. demographics01.txt) into a plain CSV that load_hcp_data can read.
+
+    NDA's structured-data text files follow a documented but pandas-unfriendly
+    layout that a plain pd.read_csv() will misparse:
+      line 1: "<data_structure_short_name>,<version>"  -- not data, e.g. "ndar_subject01,1"
+      line 2: short column names                        -- the header we actually want
+      line 3: long-form column descriptions              -- not data
+      line 4+: actual rows, tab-separated
+
+    Rather than hardcoding those line numbers (some exports omit the marker line,
+    or the description row), both are detected heuristically: the marker line is
+    identified by having no field separator, and the description row by having a
+    much higher average word-count per field than real data does. A plain
+    CSV/TSV with no preamble at all passes through unchanged.
+
+    Args:
+        txt_path: Path to the raw NDA .txt export.
+        out_csv_path: Where to write the cleaned CSV. Defaults to
+            "<txt_path without extension>_clean.csv".
+        sep: Field separator used in the export (NDA uses tabs).
+
+    Returns:
+        The path to the cleaned CSV (out_csv_path).
+    """
+    with open(txt_path, 'r', encoding='utf-8-sig') as f:
+        raw_lines = f.readlines()
+    raw_lines = [ln.rstrip('\n').rstrip('\r') for ln in raw_lines if ln.strip() != '']
+
+    idx = 0
+    # Marker line has no field separator but does have a comma, e.g. "ndar_subject01,1"
+    if sep not in raw_lines[0] and ',' in raw_lines[0]:
+        idx = 1
+
+    header_fields = raw_lines[idx].split(sep)
+    data_start = idx + 1
+
+    if data_start < len(raw_lines):
+        next_fields = raw_lines[data_start].split(sep)
+        if len(next_fields) == len(header_fields):
+            nonempty = [f for f in next_fields if f.strip()]
+            avg_words = np.mean([len(f.split()) for f in nonempty]) if nonempty else 0
+            if avg_words > 1.5:  # reads like prose -> this is the description row
+                data_start += 1
+
+    csv_text = sep.join(header_fields) + '\n' + '\n'.join(raw_lines[data_start:])
+    df = pd.read_csv(io.StringIO(csv_text), sep=sep)
+
+    if out_csv_path is None:
+        out_csv_path = os.path.splitext(txt_path)[0] + '_clean.csv'
+    df.to_csv(out_csv_path, index=False)
+    print(f"Wrote cleaned CSV ({len(df)} rows, {len(df.columns)} cols) to {out_csv_path}")
+    print(f"Columns: {list(df.columns)}")
+    return out_csv_path
+
+
+def generate_distance_data(n_samples, vol_size=32, swapped=False, seed=None):
+    """
+    Generate synthetic data for distance classification task.
+    Two dots in 3D space - classify based on their distance.
+    
+    Args:
+        n_samples: Number of samples to generate
+        vol_size: Size of 3D volume
+        swapped: If True, swap left/right position (for distribution shift)
+        seed: Random seed
+        
+    Returns:
+        X: Tensor of shape (n_samples, 1, vol_size, vol_size, vol_size)
+        Y: Tensor of labels (n_samples,)
+    """
+    if seed is not None:
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+    
+    X = torch.zeros(n_samples, 1, vol_size, vol_size, vol_size)
+    Y = torch.zeros(n_samples, dtype=torch.long)
+    
+    for i in range(n_samples):
+        # Randomly choose class
+        label = np.random.randint(0, 2)
+        
+        # Set distance based on class
+        if label == 0:  # Close
+            distance = np.random.uniform(3, 8)
+        else:  # Far
+            distance = np.random.uniform(12, 18)
+        
+        # Random center point
+        center = np.random.uniform(vol_size * 0.3, vol_size * 0.7, 3)
+        
+        # Random direction
+        direction = np.random.randn(3)
+        direction = direction / np.linalg.norm(direction)
+        
+        # Calculate two points
+        point1 = center - direction * distance / 2
+        point2 = center + direction * distance / 2
+        
+        # Swap positions if requested (for distribution shift)
+        if swapped:
+            if point1[0] < vol_size / 2:  # If left
+                point1[0] = vol_size - point1[0]  # Move to right
+            if point2[0] < vol_size / 2:
+                point2[0] = vol_size - point2[0]
+        
+        # Clip to volume bounds
+        point1 = np.clip(point1, 0, vol_size - 1).astype(int)
+        point2 = np.clip(point2, 0, vol_size - 1).astype(int)
+        
+        # Place dots
+        X[i, 0, point1[0], point1[1], point1[2]] = 1
+        X[i, 0, point2[0], point2[1], point2[2]] = 1
+        Y[i] = label
+    
+    return X, Y
+
+class BalancedDataset(Dataset):
+    def __init__(self, X, Y):
+        self.X, self.Y = X, Y
+        self.pos_idx = np.where(Y == 1)[0]
+        self.neg_idx = np.where(Y == 0)[0]
+        self.count = max(len(self.pos_idx), len(self.neg_idx)) * 2
+
+    def __len__(self): return self.count
+
+    def __getitem__(self, idx):
+        i = np.random.choice(self.pos_idx) if idx % 2 == 0 else np.random.choice(self.neg_idx)
+        return self.X[i], self.Y[i]

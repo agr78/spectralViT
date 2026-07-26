@@ -621,5 +621,3 @@ def laplacian_tokenize(img_size, img_clean, img_noisy, k, threshold=0.03, topo_l
     tokens = evecs.T @ img_noisy.flatten()
     img_recon = (evecs @ tokens).reshape(img_size, img_size)
     return tokens, img_recon
-
-

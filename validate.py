@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.optim.lr_scheduler import OneCycleLR
 from sklearn.decomposition import PCA
 from sklearn.model_selection import KFold
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, mean_absolute_error
 from sklearn.preprocessing import StandardScaler
 from util import mean_std_str, seed_everything
 from networks import SpectralViT, SpatialViT
@@ -159,6 +159,129 @@ def SpatialViT_cv(X, Y, patch_candidates, device, vol_size=96, epochs=20, lr=1e-
 
     return max(results, key=lambda k: np.mean(results[k]))
 
+def SpectralViT_cv_regression(X_flat, Y, pca_candidates, device, epochs=20, lr=1e-3):
+    """
+    Regression analog of SpectralViT_cv: picks the number of PCA components that
+    gives the lowest held-out MAE (in years) instead of the highest AUC.
+
+    Age is standardized (mean/std fit on the TRAIN fold only) before being handed to
+    the network, since MSE/OneCycleLR are easier to optimize against a ~N(0,1) target
+    than a raw ~[8, 100] year value; predictions are converted back to years before
+    MAE is computed, so the reported numbers are directly interpretable.
+    """
+    seed_everything(0)
+    kf_peek = KFold(n_splits=5, shuffle=True, random_state=0)
+    for _, test_idx in kf_peek.split(X_flat):
+        fixed_batch_size = len(test_idx)
+
+    results = {}
+    print(f"\nStarting Selection over PCA components: {pca_candidates}")
+
+    for n_comp in pca_candidates:
+        kf = KFold(n_splits=5, shuffle=True, random_state=0)
+        fold_maes = []
+
+        for train_idx, test_idx in kf.split(X_flat):
+            torch.cuda.empty_cache()
+
+            pca_model = PCA(n_components=n_comp, whiten=True).fit(X_flat[train_idx])
+            tr_pca = torch.from_numpy(pca_model.transform(X_flat[train_idx])).float()
+
+            y_mean, y_std = Y[train_idx].mean(), Y[train_idx].std() + 1e-8
+            tr_y = torch.from_numpy((Y[train_idx] - y_mean) / y_std).float()
+            ts_pca = torch.from_numpy(pca_model.transform(X_flat[test_idx])).float().to(device)
+            ts_y_fold = Y[test_idx]  # kept in raw years for MAE
+
+            loader = DataLoader(TensorDataset(tr_pca, tr_y), batch_size=fixed_batch_size, shuffle=True)
+
+            model = SpectralViT(
+                n_inputs=n_comp, n_heads=2, embed_dim=16, n_layers=4,
+                patch_size=1, use_rank_weights=True, learnable_rank_weights=True,
+                use_input_proj=True, use_pos_embed=True, pooling='mean',
+                use_layer_norm=True, use_sigmoid=False
+            ).to(device)
+
+            opt = optim.AdamW(model.parameters(), lr=lr)
+            sched = OneCycleLR(opt, max_lr=lr, steps_per_epoch=len(loader), epochs=epochs)
+            crit = nn.MSELoss()
+
+            for _ in range(epochs):
+                model.train()
+                for b_pca, b_y in loader:
+                    b_pca, b_y = b_pca.to(device), b_y.to(device)
+                    opt.zero_grad()
+                    loss = crit(model(b_pca), b_y)
+                    loss.backward()
+                    opt.step()
+                    sched.step()
+
+            model.eval()
+            with torch.no_grad():
+                preds = model(ts_pca).cpu().numpy() * y_std + y_mean
+                fold_maes.append(mean_absolute_error(ts_y_fold, preds))
+
+        results[n_comp] = fold_maes
+        print(f"  n_components={n_comp}: MAE = {mean_std_str(fold_maes)} yrs")
+
+    return min(results, key=lambda k: np.mean(results[k]))
+
+def SpatialViT_cv_regression(X, Y, patch_candidates, device, vol_size=96, epochs=20, lr=1e-3,
+                              physical_bs=2, effective_bs=8):
+    """Regression analog of SpatialViT_cv: picks the patch size with lowest held-out MAE."""
+    seed_everything(0)
+    accumulation_steps = effective_bs // physical_bs
+    results = {}
+    print(f"\nStarting Selection over Patch Sizes: {patch_candidates}")
+
+    for p_size in patch_candidates:
+        kf = KFold(n_splits=5, shuffle=True, random_state=0)
+        fold_maes = []
+
+        for train_idx, test_idx in kf.split(X):
+            torch.cuda.empty_cache()
+
+            tr_vol = torch.from_numpy(X[train_idx]).unsqueeze(1).float()
+            y_mean, y_std = Y[train_idx].mean(), Y[train_idx].std() + 1e-8
+            tr_y = torch.from_numpy((Y[train_idx] - y_mean) / y_std).float()
+            ts_vol = torch.from_numpy(X[test_idx]).unsqueeze(1).float().to(device)
+            ts_y_fold = Y[test_idx]
+
+            loader = DataLoader(TensorDataset(tr_vol, tr_y), batch_size=physical_bs, shuffle=True)
+
+            model = SpatialViT(
+                vol_size=vol_size, patch_size=p_size, embed_dim=128, n_heads=4, n_layers=2,
+                dropout=0.2, is_2d=False, use_cls_token=True, use_layer_norm=True, use_sigmoid=False
+            ).to(device)
+
+            opt = optim.AdamW(model.parameters(), lr=lr)
+            steps_per_epoch = len(loader) // accumulation_steps
+            sched = OneCycleLR(opt, max_lr=lr, steps_per_epoch=steps_per_epoch, epochs=epochs)
+            crit = nn.MSELoss()
+
+            for _ in range(epochs):
+                model.train()
+                for i, (b_vol, b_y) in enumerate(loader):
+                    b_vol, b_y = b_vol.to(device), b_y.to(device)
+                    loss = crit(model(b_vol), b_y) / accumulation_steps
+                    loss.backward()
+                    if (i + 1) % accumulation_steps == 0:
+                        opt.step()
+                        sched.step()
+                        opt.zero_grad()
+
+            model.eval()
+            with torch.no_grad():
+                test_preds = []
+                for chunk in torch.split(ts_vol, physical_bs):
+                    test_preds.append(model(chunk))
+                preds = torch.cat(test_preds).cpu().numpy() * y_std + y_mean
+                fold_maes.append(mean_absolute_error(ts_y_fold, preds))
+
+        results[p_size] = fold_maes
+        print(f"  patch_size={p_size}: MAE = {mean_std_str(fold_maes)} yrs")
+
+    return min(results, key=lambda k: np.mean(results[k]))
+
 def ClinicalTransformer_cv(model_class, model_kwargs, pos_weight_grid, outer_skf, unique_subjs, y_unique, tr_subj_map, X_tr_clin, y_tr_slices, NEG_WEIGHT, criterion, JITTER_STD, EPOCHS, device):
     """
     Optimizes pos_weight by re-initializing the model for every fold to prevent data leakage
@@ -290,4 +413,3 @@ def ResidualSpectralViT_cv(model_classes, model_kwargs, pca_components_grid, out
     N_PCA_COMPONENTS = pca_components_grid[np.argmax([np.mean(pca_results[n]) for n in pca_components_grid])]
     print(f"Selected PCA components: {N_PCA_COMPONENTS}")
     return N_PCA_COMPONENTS
-

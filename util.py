@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import random
 from scipy.interpolate import PchipInterpolator
 from sklearn.metrics import recall_score, roc_auc_score, confusion_matrix, f1_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import scipy.stats as stats
 import numpy as np
 from networks import pca_tokenize, fourier_tokenize, laplacian_tokenize
@@ -31,14 +32,55 @@ def mean_std_str(values):
     values = np.asarray(values)
     return f"{np.mean(values):.3f} ± {np.std(values):.3f}"
 
+def delong_roc_variance(ground_truth, predictions):
+    """
+    Computes the structural components (V10 and V01) for DeLong's variance.
+    """
+    m = sum(ground_truth == 1)
+    n = sum(ground_truth == 0)
+    
+    # Get scores of positives and negatives
+    pos = predictions[ground_truth == 1]
+    neg = predictions[ground_truth == 0]
+    
+    # Compute structural components (V10 and V01)
+    # v10[i] captures how often negative samples score lower than the i-th positive sample
+    v10 = np.array([np.sum(neg < p) + 0.5 * np.sum(neg == p) for p in pos]) / n
+    # v01[j] captures how often positive samples score higher than the j-th negative sample
+    v01 = np.array([np.sum(pos > p) + 0.5 * np.sum(pos == p) for p in neg]) / m
+    
+    return v10, v01
+
 def compare_auc_significance(y_true, prob_base, prob_model):
-    """Asymptotic comparison of AUCs (DeLong-like approximation)."""
+    """
+    Exact implementation of the DeLong test for two correlated ROC curves.
+    """
+    y_true = np.array(y_true)
+    prob_base = np.array(prob_base)
+    prob_model = np.array(prob_model)
+    
     auc_base = roc_auc_score(y_true, prob_base)
     auc_model = roc_auc_score(y_true, prob_model)
-    n1, n0 = sum(y_true == 1), sum(y_true == 0)
-    var_diff = ((auc_base * (1 - auc_base) + (n1 - 1) * (0.1 - auc_base**2) + (n0 - 1) * (0.1 - auc_base**2)) / (n1 * n0))
+    
+    # Get structural components
+    v10_base, v01_base = delong_roc_variance(y_true, prob_base)
+    v10_model, v01_model = delong_roc_variance(y_true, prob_model)
+    
+    # Covariance matrices of the structural components
+    S10 = np.cov(v10_base, v10_model)
+    S01 = np.cov(v01_base, v01_model)
+    
+    m = sum(y_true == 1)
+    n = sum(y_true == 0)
+    
+    # DeLong variance of the difference (accounting for covariance)
+    var_diff = (S10[0, 0] + S10[1, 1] - 2 * S10[0, 1]) / m + \
+               (S01[0, 0] + S01[1, 1] - 2 * S01[0, 1]) / n
+               
+    # Z-score and two-sided p-value
     z = (auc_model - auc_base) / np.sqrt(max(var_diff, 1e-8))
-    p_value = 1 - stats.norm.cdf(z)
+    p_value = 2 * (1 - stats.norm.cdf(abs(z)))
+    
     return auc_model - auc_base, p_value
 
 def mask_crop(data, mask, pad, viz=False):
@@ -149,6 +191,103 @@ def get_metrics_array(y_true, y_probs):
     spec = tn / (tn + fp) if (tn + fp) > 0 else 0
     auc = roc_auc_score(y_true, y_probs)
     return np.array([acc, sens, spec, auc])
+
+def plot_all_model_losses_regression(spectral_vit_history,
+                                      spatial_vit_history,
+                                      compact_spatial_vit_history,
+                                      unet_history, swin_history,
+                                      EPOCHS, loss_name='MSE'):
+    """
+    Regression counterpart of plot_all_model_losses. Age-prediction losses (MSE/MAE)
+    have no fixed [0, 1] range the way BCE does, so the y-axis is left to autoscale.
+    """
+    combined = {**spectral_vit_history, **spatial_vit_history, **compact_spatial_vit_history,
+                **unet_history, **swin_history}
+    plt.figure(figsize=(12, 7))
+
+    configs = [
+        ('spectral_vit_loss', 'Spectral ViT', 'tab:blue', '-'),
+        ('spatial_vit_loss', 'Spatial ViT (Heavy)', 'tab:orange', '--'),
+        ('compact_spatial_vit_loss', 'Spatial ViT (Matched)', 'tab:green', '--'),
+        ('swin_loss', 'Swin ViT', 'tab:purple', '-.'),
+        ('unet_loss', 'Attn U-Net', 'tab:red', ':'),
+    ]
+
+    for key, label, color, style in configs:
+        if key in combined and len(combined[key]) > 0:
+            data = np.array(combined[key])
+            mean_loss = np.mean(data, axis=0)
+            std_loss = np.std(data, axis=0)
+            epochs = range(1, len(mean_loss) + 1)
+
+            plt.plot(epochs, mean_loss, label=label, color=color, linestyle=style, lw=2)
+            plt.fill_between(epochs, mean_loss - std_loss, mean_loss + std_loss, color=color, alpha=0.1)
+
+    plt.title("Cross-Validated Training Loss: Model Comparison (Age Regression)", fontsize=14)
+    plt.xlabel("Epochs")
+    plt.ylabel(f"{loss_name} Loss")
+    plt.xlim([1, EPOCHS])
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.show()
+
+def get_metrics_array_regression(y_true, y_pred):
+    """
+    Regression counterpart of get_metrics_array: MAE and RMSE (in years), R^2, and
+    Pearson r between predicted and chronological age -- the standard quartet
+    reported in brain-age papers, in place of Accuracy/Sensitivity/Specificity/AUC.
+    """
+    y_true = np.asarray(y_true).ravel()
+    y_pred = np.asarray(y_pred).ravel()
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2 = r2_score(y_true, y_pred) if len(y_true) > 1 else float('nan')
+    if len(y_true) > 1 and np.std(y_pred) > 0 and np.std(y_true) > 0:
+        r, _ = stats.pearsonr(y_true, y_pred)
+    else:
+        r = float('nan')
+    return np.array([mae, rmse, r2, r])
+
+def paired_ttest_abs_error(y_true, pred_a, pred_b):
+    """
+    Regression analog of McNemar's test: a paired t-test on each model's per-subject
+    absolute error, asking whether model A's errors are systematically larger or
+    smaller than model B's on the *same* held-out subjects.
+    """
+    y_true = np.asarray(y_true).ravel()
+    err_a = np.abs(np.asarray(pred_a).ravel() - y_true)
+    err_b = np.abs(np.asarray(pred_b).ravel() - y_true)
+    stat, p_value = stats.ttest_rel(err_a, err_b)
+    return float(stat), float(p_value)
+
+def paired_bootstrap_mae_test(y_true, pred_a, pred_b, n_boot=2000, seed=0):
+    """
+    Regression analog of DeLong's test: a paired bootstrap over the held-out subjects
+    (resampling subjects, not errors independently) to test whether the difference in
+    MAE between two models is larger than expected from sampling noise alone. This
+    respects the correlation between the two models' errors the same way DeLong's
+    test respects correlated ROC curves, without needing a closed-form variance
+    formula for MAE.
+    """
+    rng = np.random.RandomState(seed)
+    y_true = np.asarray(y_true).ravel()
+    pred_a = np.asarray(pred_a).ravel()
+    pred_b = np.asarray(pred_b).ravel()
+    n = len(y_true)
+
+    mae_a = np.mean(np.abs(pred_a - y_true))
+    mae_b = np.mean(np.abs(pred_b - y_true))
+    observed_diff = mae_a - mae_b
+
+    diffs = np.empty(n_boot)
+    for i in range(n_boot):
+        idx = rng.randint(0, n, n)
+        diffs[i] = (np.mean(np.abs(pred_a[idx] - y_true[idx])) -
+                    np.mean(np.abs(pred_b[idx] - y_true[idx])))
+
+    p_value = 2 * min(np.mean(diffs >= 0), np.mean(diffs <= 0))
+    p_value = float(min(p_value, 1.0))
+    return float(observed_diff), p_value
 
 def generate_distance_data(n_samples, VOL_SIZE, swapped=False):
     X = torch.zeros((n_samples, 1, VOL_SIZE, VOL_SIZE, VOL_SIZE))
