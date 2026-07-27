@@ -14,9 +14,9 @@ class SpectralViT(nn.Module):
         n_heads=2, 
         embed_dim=16, 
         n_layers=4, 
-        patch_size=1,           # Optional
-        sampling_indices=None,  # Optional
-        use_rank_weights=True,  # Optional
+        patch_size=1,          
+        sampling_indices=None,  
+        use_rank_weights=True,  
         use_mode_weights=False,
         use_input_proj=True,    
         use_pos_embed=True,     
@@ -121,106 +121,6 @@ class SpectralViT(nn.Module):
         if self.use_sigmoid and not return_logit:
             return torch.sigmoid(logit)
         return logit
-
-# class SpectralViT(nn.Module):
-#     """
-#     Fully Unified Spectral ViT.
-#     Works for:
-#     1. Simulation script (needs learnable_rank_weights=False, use_layer_norm=False)
-#     2. Medical script (needs use_input_proj, use_pos_embed, use_mode_weights)
-#     """
-#     def __init__(
-#         self, 
-#         n_inputs, 
-#         n_heads=2, 
-#         embed_dim=16, 
-#         n_layers=4, 
-#         use_mode_weights=False,
-#         use_input_proj=True,    # Restored
-#         use_pos_embed=True,     # Restored
-#         pooling='mean',         
-#         use_layer_norm=True,    
-#         learnable_rank_weights=True,
-#         use_sigmoid=False       
-#     ):
-#         super().__init__()
-#         self.use_mode_weights = use_mode_weights
-#         self.use_pos_embed = use_pos_embed
-#         self.pooling = pooling
-#         self.use_sigmoid = use_sigmoid
-#         self.use_input_proj = use_input_proj
-
-#         # 1. Spectral decay (1/f) logic
-#         ranks = torch.arange(1, n_inputs + 1, dtype=torch.float32)
-#         if learnable_rank_weights:
-#             self.rank_weights = nn.Parameter(1.0 / ranks)
-#         else:
-#             self.register_buffer('rank_weights', 1.0 / ranks)
-
-#         # 2. Input Projection Logic
-#         # DBS/IXI behavior uses d_model=1 or d_model=embed_dim
-#         self.d_model = embed_dim if (use_input_proj or use_mode_weights) else 1
-
-#         if self.use_mode_weights:
-#             self.mode_weights = nn.Parameter(torch.randn(n_inputs, self.d_model) * 0.02)
-#         elif self.use_input_proj:
-#             self.input_proj = nn.Linear(1, self.d_model)
-#         else:
-#             self.input_proj = nn.Identity()
-
-#         # 3. Positional Embedding Logic
-#         if self.use_pos_embed:
-#             self.pos_embed = nn.Parameter(torch.randn(n_inputs, 1, self.d_model) * 0.02)
-
-#         # 4. Transformer
-#         encoder_layer = nn.TransformerEncoderLayer(
-#             d_model=self.d_model, 
-#             nhead=n_heads, 
-#             dim_feedforward=embed_dim * 2, 
-#             dropout=0.1
-#         )
-#         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-
-#         # 5. Head Logic
-#         head_in = self.d_model if pooling == 'mean' else (self.d_model * n_inputs)
-        
-#         if use_layer_norm:
-#             self.mlp_head = nn.Sequential(nn.LayerNorm(head_in), nn.Linear(head_in, 1))
-#         else:
-#             self.mlp_head = nn.Linear(head_in, 1)
-
-#     def forward(self, x, return_logit=False):
-#         if x.ndim == 1: x = x.unsqueeze(0)
-        
-#         # Apply 1/f weighting
-#         x = x * self.rank_weights
-        
-#         # Apply Projection
-#         if self.use_mode_weights:
-#             x = x.unsqueeze(-1) * self.mode_weights.unsqueeze(0)
-#             x = x.transpose(0, 1)
-#         else:
-#             # Result: [seq_len, batch, d_model]
-#             x = self.input_proj(x.unsqueeze(-1)).transpose(0, 1)
-        
-#         # Add Position
-#         if self.use_pos_embed:
-#             x = x + self.pos_embed
-            
-#         x = self.transformer(x)
-        
-#         # Pooling
-#         if self.pooling == 'mean':
-#             x = x.mean(dim=0)
-#         else:
-#             x = x.transpose(0, 1).flatten(1)
-            
-#         logit = self.mlp_head(x).squeeze(-1)
-#         if logit.ndim == 0: logit = logit.unsqueeze(0)
-
-#         if self.use_sigmoid and not return_logit:
-#             return torch.sigmoid(logit)
-#         return logit
     
 class SpatialViT(nn.Module):
     def __init__(self, size=96, vol_size=None, patch_size=12, embed_dim=128, n_heads=4, n_layers=2, 
@@ -299,74 +199,6 @@ class SpatialViT(nn.Module):
         if self.use_sigmoid and not return_logit:
             return torch.sigmoid(logit)
         return logit
-
-# class SpatialViT(nn.Module):
-#     """
-#     Unified Spatial ViT.
-#     DBS behavior: is_2d=True, use_cls_token=False (uses mean)
-#     IXI behavior: is_2d=False, use_cls_token=True, vol_size=96
-#     """
-#     def __init__(self, size=96, vol_size=None, patch_size=12, embed_dim=128, n_heads=4, n_layers=2, 
-#                  dropout=0.2, is_2d=False, use_cls_token=True, use_layer_norm=True, use_sigmoid=False):
-#         super().__init__()
-#         # Compatibility for 'size' (DBS) vs 'vol_size' (IXI)
-#         actual_size = vol_size if vol_size is not None else size
-#         self.patch_size = patch_size
-#         self.is_2d = is_2d
-#         self.use_cls_token = use_cls_token
-#         self.use_sigmoid = use_sigmoid
-        
-#         if is_2d:
-#             self.n_patches = (actual_size // patch_size) ** 2
-#             proj_in = patch_size ** 2
-#         else:
-#             self.n_patches = (actual_size // patch_size) ** 3
-#             proj_in = patch_size ** 3
-
-#         self.proj = nn.Linear(proj_in, embed_dim)
-        
-#         if use_cls_token:
-#             self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
-#             pos_len = self.n_patches + 1
-#         else:
-#             pos_len = self.n_patches
-
-#         self.pos_embed = nn.Parameter(torch.randn(pos_len, 1, embed_dim) * 0.02)
-
-#         encoder_layer = nn.TransformerEncoderLayer(
-#             d_model=embed_dim, nhead=n_heads, dim_feedforward=embed_dim * 2, dropout=dropout
-#         )
-#         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-
-#         if use_layer_norm:
-#             self.head = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 1))
-#         else:
-#             self.head = nn.Linear(embed_dim, 1)
-
-#     def forward(self, x, return_logit=False):
-#         b = x.shape[0]
-#         p = self.patch_size
-#         if self.is_2d:
-#             x = x.unfold(2, p, p).unfold(3, p, p)
-#         else:
-#             x = x.unfold(2, p, p).unfold(3, p, p).unfold(4, p, p)
-
-#         x = self.proj(x.contiguous().view(b, self.n_patches, -1)).transpose(0, 1)
-
-#         if self.use_cls_token:
-#             cls_tokens = self.cls_token.expand(1, b, -1)
-#             x = torch.cat((cls_tokens, x), dim=0)
-
-#         x = x + self.pos_embed
-#         x = self.transformer(x)
-
-#         x_pool = x[0] if self.use_cls_token else x.mean(dim=0)
-#         logit = self.head(x_pool).squeeze(-1)
-        
-#         if logit.ndim == 0: logit = logit.unsqueeze(0)
-#         if self.use_sigmoid and not return_logit:
-#             return torch.sigmoid(logit)
-#         return logit
 
 
 class ClinicalTransformer(nn.Module):
@@ -494,9 +326,9 @@ class AttentionUNet(nn.Module):
             self.attn = AttentionBlock(is_spatial_2d=True)
             self.gmp = nn.AdaptiveMaxPool2d(1)
             self.fc = nn.Sequential(
-                nn.Linear(base_channels*4, base_channels*2), # 64 -> 32
+                nn.Linear(base_channels*4, base_channels*2), 
                 nn.ReLU(inplace=True),
-                nn.Linear(base_channels*2, 1)                # 32 -> 1
+                nn.Linear(base_channels*2, 1)              
             )
             nn.init.zeros_(self.fc[-1].weight)
             nn.init.zeros_(self.fc[-1].bias)
