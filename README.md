@@ -23,20 +23,14 @@ If this code is used, please cite the following:
 ## BibTex
 
 ```bibtex
-@article{Roberts_RadDBS-QSM_2025,
-  title    = "Technical feasibility of quantitative susceptibility mapping
-              radiomics for predicting deep brain stimulation outcomes in
-              Parkinson disease",
-  author   = "Roberts, Alexandra G and Zhang, Jinwei and Tozlu, Ceren and
-              Romano, Dominick and Akkus, Sema and Kim, Heejong and Sabuncu,
-              Mert R and Spincemaille, Pascal and Li, Jianqi and Wang, Yi and
-              Wu, Xi and Kopell, Brian H",
-  journal  = "Neurosurgery",
-  month    =  sep,
-  year     =  2025,
-  keywords = "Deep brain stimulation; Machine learning; Parkinson disease;
-              Quantitative susceptibility mapping; Radiomics; Regression",
-  language = "en"
+@article{roberts2026spectralViT,
+      title={Spectral Vision Transformer for Efficient Tokenization with Limited Data}, 
+      author={Alexandra G. Roberts and Maneesh John and Jinwei Zhang and Dominick Romano and Mert Sisman and Ki Sueng Choi and Heejong Kim and Mert R. Sabuncu and Thanh D. Nguyen and Alexey V. Dimov and Pascal Spincemaille and Brian H. Kopell and Yi Wang},
+      year={2026},
+      eprint={2605.12026},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2605.12026}, 
 }
 ```
 
