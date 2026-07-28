@@ -39,13 +39,10 @@ from networks import SpectralViT, SpatialViT
 def SpectralViT_cv(X_flat, Y, pca_candidates, device, epochs=20, lr=1e-3):
     """EXACT replication of the standalone Spectral script logic."""
     
-    # 1. To match the standalone script, we must reset the seed to 0 
-    # RIGHT before we start the candidate loop.
+    # 1. Reset the seed to 0 
     seed_everything(0)
     
-    # 2. Replicate the 'leaked' BATCH_SIZE = len(ts_y).
-    # In a 5-fold split of IXI (566 samples), the last fold size is 113.
-    # We simulate this by taking the last fold size of a dummy split.
+    # 2. Batch size
     kf_peek = KFold(n_splits=5, shuffle=True, random_state=0)
     for _, test_idx in kf_peek.split(X_flat):
         fixed_batch_size = len(test_idx) 
@@ -67,7 +64,6 @@ def SpectralViT_cv(X_flat, Y, pca_candidates, device, epochs=20, lr=1e-3):
             ts_pca = torch.from_numpy(pca_model.transform(X_flat[test_idx])).float().to(device)
             ts_y_fold = torch.from_numpy(Y[test_idx]).float().to(device)
             
-            # Use the FIXED batch size to match the original script's global variable
             loader = DataLoader(TensorDataset(tr_pca, tr_y), batch_size=fixed_batch_size, shuffle=True)
             
             # Initialize Model
@@ -170,7 +166,6 @@ def ClinicalTransformer_cv(model_class, model_kwargs, pos_weight_grid, outer_skf
     for pos_weight in pos_weight_grid:
         fold_aucs = []
         for fold_idx, (train_subj_idx, val_subj_idx) in enumerate(outer_skf.split(unique_subjs, y_unique)):
-            # --- FIX: Re-initialize the model for every fold ---
             model = model_class(**model_kwargs).to(device)
             
             train_subjects, val_subjects = unique_subjs[train_subj_idx], unique_subjs[val_subj_idx]

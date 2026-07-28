@@ -8,12 +8,17 @@ hierarchical order. Our approach introduces a global inductive bias and spectral
 ## Summary
 Efficient image tokenization using projections on to spectral bases to reduce the number of parameters associated with fitting vision transformers.
 
+## Install
+The `dpeekenv` can be installed from `dpeekenv.yml` or
+```pip install -r requirements.txt```
+
 ## Contents
 Various tokenizations can be found in `bases.ipynb` <br/>
 Sample size varying pattern classifications can be found in `pattern.ipynb` <br/>
 The spatially invariant Fourier basis example can be found in `objects.ipynb` <br/>
 Sex classification for all models can be found in `ixi.ipynb` <br/>
 Candidate selection can be found in `dbs.ipynb` <br/>
+Added benchmark `mnist.ipynb`
 
 ## Publications
 If this code is used, please cite the following:
